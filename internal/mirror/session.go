@@ -832,17 +832,17 @@ func (s *Session) spawnDecoder(w, h int, bsf bool) (io.WriteCloser, error) {
 	}
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
-		"-fflags", "nobuffer+discardcorrupt+flush_packets",
+		"-fflags", "nobuffer",
 		"-flags", "+low_delay",
-		"-probesize", "32",
-		"-analyzeduration", "0",
-		"-fpsprobesize", "0",
-		"-max_delay", "0",
-		"-avioflags", "direct",
-		"-seekable", "0",
-		"-thread_queue_size", "1",
-		// One thread. Frame threading delays the picture by one frame per thread.
-		"-threads", "1",
+		// The default probe holds the first picture for about a second.
+		// A short cap still parses the stream; 0 and a tiny probesize drop every frame.
+		"-probesize", "5000000",
+		"-analyzeduration", "100000",
+		"-fpsprobesize", "1",
+		// Slice threads speed 1080p up. low_delay above stops frame threading,
+		// which would add one frame of delay per thread.
+		"-threads", "4",
+		"-thread_type", "slice",
 		"-f", "h264",
 	}
 	if bsf {
