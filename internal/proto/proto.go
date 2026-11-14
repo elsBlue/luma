@@ -52,6 +52,7 @@ const (
 
 	flagConfig  uint64 = 1 << 62
 	flagKey     uint64 = 1 << 61
+	ptsMask     uint64 = (1 << 61) - 1
 	flagSession byte   = 0x80
 )
 
@@ -179,6 +180,7 @@ type VideoHeader struct {
 	Session bool
 	Config  bool
 	Key     bool
+	PTS     uint64
 	Width   int
 	Height  int
 	Size    int
@@ -199,6 +201,7 @@ func ParseVideoHeader(h []byte) (VideoHeader, error) {
 	return VideoHeader{
 		Config: pts&flagConfig != 0,
 		Key:    pts&flagKey != 0,
+		PTS:    pts & ptsMask,
 		Size:   int(binary.BigEndian.Uint32(h[8:12])),
 	}, nil
 }

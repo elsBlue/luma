@@ -28,7 +28,7 @@ Click the picture to tap. Drag to swipe. Scroll the wheel to scroll. Type to sen
 
 - Back, Home, Recents, volume, power, rotate
 - Picture: Fast, 720p, 1080p, YouTube. Nothing is encoded above 1080p (long side 1920).
-- USB uses a zero-buffer H.264 decode, so taps and the picture stay close to the phone.
+- USB keeps only the newest frame (it does not play through a backlog) and asks the phone encoder for the shortest delay it will accept.
 - Screenshot (saved in `Pictures\Luma`)
 - Record at the stream you picked (saved in `Videos\Luma`, ready to drop into YouTube)
 - Paste your PC clipboard onto the phone

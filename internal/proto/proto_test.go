@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -36,8 +37,15 @@ func TestVideoHeader(t *testing.T) {
 	media[0] = 0x60 // config + key
 	media[11] = 4
 	v, err = ParseVideoHeader(media)
-	if err != nil || v.Session || !v.Config || !v.Key || v.Size != 4 {
+	if err != nil || v.Session || !v.Config || !v.Key || v.Size != 4 || v.PTS != 0 {
 		t.Fatalf("%+v %v", v, err)
+	}
+	timed := make([]byte, 12)
+	binary.BigEndian.PutUint64(timed[:8], 1_500_000)
+	binary.BigEndian.PutUint32(timed[8:], 9)
+	v, err = ParseVideoHeader(timed)
+	if err != nil || v.Config || v.Key || v.PTS != 1_500_000 || v.Size != 9 {
+		t.Fatalf("pts %+v %v", v, err)
 	}
 }
 

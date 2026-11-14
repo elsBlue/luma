@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
@@ -76,6 +77,10 @@ type Session struct {
 	moveMu      sync.Mutex
 	movePending []byte
 	moveTimer   *time.Timer
+
+	ptsBase  uint64
+	wallBase time.Time
+	lag      time.Duration
 
 	jobs    chan func()
 	on      func()
@@ -283,7 +288,7 @@ func (s *Session) queueMove(msg []byte) {
 	s.moveMu.Lock()
 	s.movePending = msg
 	if s.moveTimer == nil {
-		s.moveTimer = time.AfterFunc(4*time.Millisecond, func() {
+		s.moveTimer = time.AfterFunc(time.Millisecond, func() {
 			s.moveMu.Lock()
 			s.moveTimer = nil
 			msg := s.movePending
@@ -336,27 +341,38 @@ func (s *Session) startSmooth() error {
 		return fmt.Errorf("could not copy the phone service: %w", err)
 	}
 	var first error
-	if err := s.tryLink(true); err != nil {
+	for _, opts := range []string{
+		// Every frame is its own keyframe, so a queued second of video can be skipped.
+		"profile:int=1,max-bframes:int=0,i-frame-interval:float=0,latency:int=0,priority:int=0,operating-rate:float=60,bitrate-mode:int=1,prepend-sps-pps-to-idr-frames:int=1,vendor.qti-ext-enc-low-latency.enable:int=1",
+		"max-bframes:int=0,i-frame-interval:float=0.1,latency:int=0,priority:int=0,operating-rate:float=60,bitrate-mode:int=1,vendor.qti-ext-enc-low-latency.enable:int=1",
+		"latency:int=0,priority:int=0,i-frame-interval:int=1,max-bframes:int=0",
+		"",
+	} {
+		err := s.tryLink(opts)
+		if err == nil {
+			if opts == "" {
+				s.Warning = "This phone rejected the low-delay encoder flags. The PC still shows the newest frame it has."
+			}
+			return nil
+		}
 		first = err
 		s.tearStream()
-		if err2 := s.tryLink(false); err2 != nil {
-			s.tearStream()
-			return fmt.Errorf("%v", first)
-		}
-		s.Warning = "This phone rejected the low-delay encoder flags. Picture is still capped at 1080p."
 	}
-	return nil
+	if first == nil {
+		first = fmt.Errorf("could not open the video stream")
+	}
+	return fmt.Errorf("%v", first)
 }
 
-func (s *Session) tryLink(low bool) error {
-	if err := s.stream(false, low); err != nil {
+func (s *Session) tryLink(opts string) error {
+	if err := s.stream(false, opts); err != nil {
 		s.tearStream()
-		return s.stream(true, low)
+		return s.stream(true, opts)
 	}
 	return nil
 }
 
-func (s *Session) stream(forward bool, low bool) error {
+func (s *Session) stream(forward bool, opts string) error {
 	scid, socket := newSCID()
 	port, err := freePort()
 	if err != nil {
@@ -384,8 +400,8 @@ func (s *Session) stream(forward bool, low bool) error {
 		s.rememberLink(false, spec)
 	}
 	codec := ""
-	if low {
-		codec = " video_codec_options=latency:int=0,priority:int=0,i-frame-interval:int=2"
+	if opts != "" {
+		codec = " video_codec_options=" + opts
 	}
 	cmdLine := fmt.Sprintf(
 		"CLASSPATH=/data/local/tmp/luma-server.jar app_process / com.genymobile.scrcpy.Server %s scid=%s log_level=info tunnel_forward=%t audio=false control=true video=true video_codec=h264 max_size=%d max_fps=%d video_bit_rate=%d stay_awake=true power_on=true send_frame_meta=true send_codec_meta=true send_device_meta=true%s",
@@ -398,8 +414,10 @@ func (s *Session) stream(forward bool, low bool) error {
 	s.mu.Lock()
 	s.shell = shell
 	s.mu.Unlock()
+	shellDone := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(io.Discard, stdout)
+		close(shellDone)
 	}()
 
 	var video, ctrl net.Conn
@@ -451,6 +469,8 @@ func (s *Session) stream(forward bool, low bool) error {
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
+	case <-shellDone:
+		return fmt.Errorf("phone encoder stopped")
 	case <-time.After(8 * time.Second):
 		s.mu.Lock()
 		ok := s.frame.Image != nil
@@ -488,9 +508,9 @@ func (s *Session) startDecoder(video net.Conn) error {
 }
 
 func (s *Session) pumpVideo(r net.Conn) {
-	br := bufio.NewReaderSize(r, 1<<20)
-	codec := make([]byte, 4)
-	if _, err := io.ReadFull(br, codec); err != nil {
+	sr := &streamReader{c: r}
+	codec, err := sr.takeBlocking(4)
+	if err != nil {
 		return
 	}
 	id := binary.BigEndian.Uint32(codec)
@@ -503,92 +523,328 @@ func (s *Session) pumpVideo(r net.Conn) {
 			_ = dec.Close()
 		}
 	}()
-	var pending [][]byte
-	hdr := make([]byte, 12)
+	var priming [][]byte
 	for s.ctx.Err() == nil {
-		if _, err := io.ReadFull(br, hdr); err != nil {
+		batch, err := s.readCatchUp(sr)
+		if err != nil || len(batch) == 0 {
 			return
 		}
-		h, err := proto.ParseVideoHeader(hdr)
-		if err != nil {
-			return
-		}
-		if h.Session {
-			if h.Width > 0 && h.Height > 0 {
-				s.mu.Lock()
-				s.videoW, s.videoH = h.Width, h.Height
-				s.mu.Unlock()
-				if dec == nil {
-					in, err := s.startRawDecoder(h.Width, h.Height)
-					if err != nil {
-						return
+		var recBlobs [][]byte
+		var view []viewPkt
+		for _, item := range batch {
+			if item.header.Session {
+				if item.header.Width > 0 && item.header.Height > 0 {
+					s.mu.Lock()
+					s.videoW, s.videoH = item.header.Width, item.header.Height
+					s.mu.Unlock()
+					if dec == nil {
+						in, err := s.startRawDecoder(item.header.Width, item.header.Height)
+						if err != nil {
+							return
+						}
+						dec = in
+						for _, blob := range priming {
+							writeLive(dec, blob)
+						}
+						priming = nil
 					}
-					dec = in
-					for _, blob := range pending {
-						_, _ = dec.Write(blob)
-					}
-					pending = nil
+				}
+				continue
+			}
+			blob := s.annexOf(item)
+			if blob == nil {
+				return
+			}
+			if !item.header.Config {
+				recBlobs = append(recBlobs, blob)
+				if item.header.PTS > 0 {
+					s.notePTS(item.header.PTS)
 				}
 			}
-			continue
+			view = append(view, viewPkt{config: item.header.Config, key: item.header.Key && !item.header.Config, blob: blob})
 		}
-		if h.Size <= 0 || h.Size > 8<<20 {
-			return
-		}
-		payload := make([]byte, h.Size)
-		if _, err := io.ReadFull(br, payload); err != nil {
-			return
-		}
-		annex := proto.AnnexB(payload)
-		s.mu.Lock()
-		if h.Config {
-			s.csd = append([]byte(nil), annex...)
-		}
-		csd := append([]byte(nil), s.csd...)
-		rec := s.recIn
-		s.mu.Unlock()
-		var blob []byte
-		if h.Config {
-			blob = annex
-		} else if h.Key && len(csd) > 0 && !proto.HasSPS(annex) {
-			blob = append(append([]byte{}, csd...), annex...)
-		} else {
-			blob = annex
-		}
+		show := displayBlobs(view)
 		if dec == nil {
-			pending = append(pending, append([]byte(nil), blob...))
-			if len(pending) > 48 {
+			priming = append(priming, show...)
+			if len(priming) > 48 {
 				return
 			}
 			continue
 		}
-		_, _ = dec.Write(blob)
-		if rec != nil && !h.Config {
-			_, _ = rec.Write(blob)
+		for _, blob := range show {
+			writeLive(dec, blob)
+		}
+		s.mu.Lock()
+		rec := s.recIn
+		s.mu.Unlock()
+		if rec != nil {
+			for _, blob := range recBlobs {
+				_, _ = rec.Write(blob)
+			}
 		}
 	}
 }
 
+type wirePkt struct {
+	header  proto.VideoHeader
+	payload []byte
+}
+
+func (s *Session) readCatchUp(sr *streamReader) ([]wirePkt, error) {
+	first, err := sr.packet()
+	if err != nil {
+		return nil, err
+	}
+	batch := []wirePkt{first}
+	for sr.moreSoon() {
+		next, err := sr.packet()
+		if err != nil {
+			if timedOut(err) {
+				break
+			}
+			return batch, err
+		}
+		batch = append(batch, next)
+		if len(batch) >= 90 {
+			break
+		}
+	}
+	return batch, nil
+}
+
+func (s *Session) annexOf(item wirePkt) []byte {
+	h := item.header
+	if h.Session {
+		return nil
+	}
+	if h.Size <= 0 || h.Size > 8<<20 || len(item.payload) != h.Size {
+		return nil
+	}
+	annex := proto.AnnexB(item.payload)
+	s.mu.Lock()
+	if h.Config {
+		s.csd = append([]byte(nil), annex...)
+	}
+	csd := append([]byte(nil), s.csd...)
+	s.mu.Unlock()
+	if h.Config {
+		return annex
+	}
+	if h.Key && len(csd) > 0 && !proto.HasSPS(annex) {
+		return append(append([]byte{}, csd...), annex...)
+	}
+	return annex
+}
+
+func writeLive(w io.Writer, blob []byte) {
+	if len(blob) == 0 {
+		return
+	}
+	_, _ = w.Write(blob)
+	// An access-unit delimiter lets the decoder emit this frame now,
+	// instead of waiting until the next one arrives.
+	_, _ = w.Write([]byte{0, 0, 0, 1, 0x09, 0xf0})
+}
+
+func (s *Session) notePTS(pts uint64) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptsBase == 0 {
+		s.ptsBase = pts
+		s.wallBase = now
+		return
+	}
+	if pts < s.ptsBase {
+		return
+	}
+	lag := now.Sub(s.wallBase) - time.Duration(pts-s.ptsBase)*time.Microsecond
+	if lag < 0 {
+		lag = 0
+	}
+	s.lag = lag
+}
+
+func (s *Session) Lag() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lag
+}
+
+type viewPkt struct {
+	config bool
+	key    bool
+	blob   []byte
+}
+
+func displayBlobs(batch []viewPkt) [][]byte {
+	lastKey := -1
+	var cfg []byte
+	for i, p := range batch {
+		if p.config && len(p.blob) > 0 {
+			cfg = p.blob
+		}
+		if p.key {
+			lastKey = i
+		}
+	}
+	if lastKey < 0 {
+		out := make([][]byte, 0, len(batch))
+		for _, p := range batch {
+			if len(p.blob) > 0 && !p.config {
+				out = append(out, p.blob)
+			}
+		}
+		if cfg != nil && len(out) > 0 {
+			return append([][]byte{cfg}, out...)
+		}
+		if cfg != nil {
+			return [][]byte{cfg}
+		}
+		return out
+	}
+	out := make([][]byte, 0, len(batch)-lastKey+1)
+	if cfg != nil {
+		out = append(out, cfg)
+	}
+	for _, p := range batch[lastKey:] {
+		if p.config || len(p.blob) == 0 {
+			continue
+		}
+		out = append(out, p.blob)
+	}
+	return out
+}
+
+type streamReader struct {
+	c   net.Conn
+	buf []byte
+}
+
+func (s *streamReader) takeBlocking(n int) ([]byte, error) {
+	if err := s.readAtLeast(n); err != nil {
+		return nil, err
+	}
+	return s.take(n), nil
+}
+
+func (s *streamReader) packet() (wirePkt, error) {
+	hdr, err := s.takeBlocking(12)
+	if err != nil {
+		return wirePkt{}, err
+	}
+	h, err := proto.ParseVideoHeader(hdr)
+	if err != nil {
+		return wirePkt{}, err
+	}
+	if h.Session {
+		return wirePkt{header: h}, nil
+	}
+	if h.Size <= 0 || h.Size > 8<<20 {
+		return wirePkt{}, fmt.Errorf("bad packet size")
+	}
+	payload, err := s.takeBlocking(h.Size)
+	if err != nil {
+		return wirePkt{}, err
+	}
+	return wirePkt{header: h, payload: payload}, nil
+}
+
+func (s *streamReader) moreSoon() bool {
+	if len(s.buf) >= 12 {
+		return true
+	}
+	_ = s.c.SetReadDeadline(time.Now().Add(300 * time.Microsecond))
+	tmp := make([]byte, 64*1024)
+	n, err := s.c.Read(tmp)
+	_ = s.c.SetReadDeadline(time.Time{})
+	if n > 0 {
+		s.buf = append(s.buf, tmp[:n]...)
+	}
+	if err != nil && !timedOut(err) {
+		return false
+	}
+	return len(s.buf) >= 12
+}
+
+func (s *streamReader) readAtLeast(n int) error {
+	for len(s.buf) < n {
+		_ = s.c.SetReadDeadline(time.Time{})
+		tmp := make([]byte, 32*1024)
+		k, err := s.c.Read(tmp)
+		if k > 0 {
+			s.buf = append(s.buf, tmp[:k]...)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *streamReader) take(n int) []byte {
+	out := make([]byte, n)
+	copy(out, s.buf[:n])
+	rest := len(s.buf) - n
+	copy(s.buf[:rest], s.buf[n:])
+	s.buf = s.buf[:rest]
+	return out
+}
+
+func timedOut(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 func (s *Session) startRawDecoder(w, h int) (io.WriteCloser, error) {
+	in, err := s.spawnDecoder(w, h, true)
+	if err != nil {
+		return s.spawnDecoder(w, h, false)
+	}
+	return in, nil
+}
+
+func (s *Session) spawnDecoder(w, h int, bsf bool) (io.WriteCloser, error) {
 	if w < 2 || h < 2 || w > 1920 || h > 1920 {
 		return nil, fmt.Errorf("frame %dx%d is outside the 1080p cap", w, h)
 	}
-	ff := exec.CommandContext(s.ctx, s.ff,
+	args := []string{
 		"-hide_banner", "-loglevel", "error",
-		"-fflags", "nobuffer+discardcorrupt",
-		"-flags", "low_delay",
+		"-fflags", "nobuffer+discardcorrupt+flush_packets",
+		"-flags", "+low_delay",
+		"-flags2", "+fast",
 		"-probesize", "32",
 		"-analyzeduration", "0",
-		"-threads", "1",
+		"-fpsprobesize", "0",
+		"-max_delay", "0",
+		"-avioflags", "direct",
+		"-seekable", "0",
+		"-thread_queue_size", "1",
+		"-threads", "4",
+		"-thread_type", "slice",
 		"-f", "h264",
+	}
+	if bsf {
+		args = append(args, "-bsf:v", "h264_metadata=num_reorder_frames=0:max_dec_frame_buffering=1")
+	}
+	args = append(args,
+		"-framerate", "60",
 		"-i", "pipe:0",
 		"-an",
-		"-threads", "1",
 		"-vsync", "0",
+		"-muxdelay", "0",
+		"-muxpreload", "0",
 		"-pix_fmt", "rgba",
 		"-f", "rawvideo",
 		"pipe:1",
 	)
+	ff := exec.CommandContext(s.ctx, s.ff, args...)
 	hide(ff)
 	stdin, err := ff.StdinPipe()
 	if err != nil {
@@ -603,26 +859,53 @@ func (s *Session) startRawDecoder(w, h int) (io.WriteCloser, error) {
 	if err := ff.Start(); err != nil {
 		return nil, fmt.Errorf("decoder: %w", err)
 	}
+	exited := make(chan struct{})
+	go func() {
+		_ = ff.Wait()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+		msg := strings.TrimSpace(ferr.String())
+		if msg == "" {
+			msg = "decoder stopped"
+		}
+		return nil, fmt.Errorf("%s", trimErr(errors.New(msg)))
+	case <-time.After(200 * time.Millisecond):
+	}
 	s.mu.Lock()
 	s.ffCmd = ff
 	s.mu.Unlock()
 	go s.pumpRaw(stdout, w, h)
-	go func() {
-		_ = ff.Wait()
-	}()
 	return stdin, nil
 }
 
 func (s *Session) pumpRaw(r io.Reader, w, h int) {
 	stride := w * h * 4
-	buf := make([]byte, stride)
 	br := bufio.NewReaderSize(r, stride)
+	file, _ := r.(*os.File)
+	imgs := [3]*image.RGBA{
+		image.NewRGBA(image.Rect(0, 0, w, h)),
+		image.NewRGBA(image.Rect(0, 0, w, h)),
+		image.NewRGBA(image.Rect(0, 0, w, h)),
+	}
+	slot := 0
+	skip := make([]byte, stride)
 	for s.ctx.Err() == nil {
-		if _, err := io.ReadFull(br, buf); err != nil {
+		for {
+			extra := br.Buffered() + pipePending(file)
+			if extra < stride*2 {
+				break
+			}
+			if _, err := io.ReadFull(br, skip); err != nil {
+				return
+			}
+		}
+		if _, err := io.ReadFull(br, imgs[slot].Pix); err != nil {
 			return
 		}
-		img := image.NewRGBA(image.Rect(0, 0, w, h))
-		copy(img.Pix, buf)
+		img := imgs[slot]
+		slot = (slot + 1) % len(imgs)
 		s.mu.Lock()
 		vw, vh := s.videoW, s.videoH
 		if vw == 0 {
@@ -848,7 +1131,9 @@ func tune(c net.Conn) {
 		return
 	}
 	_ = tcp.SetNoDelay(true)
-	_ = tcp.SetKeepAlive(true)
+	_ = tcp.SetKeepAlive(false)
+	_ = tcp.SetReadBuffer(256 * 1024)
+	_ = tcp.SetWriteBuffer(32 * 1024)
 }
 
 func readJPEG(r *bufio.Reader) ([]byte, error) {

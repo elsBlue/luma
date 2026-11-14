@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"gioui.org/app"
@@ -175,8 +176,14 @@ func (u *ui) sideBody(gtx layout.Context) layout.Dimensions {
 	q := u.quality
 	devs := u.labels()
 	selected := u.selected
-	recording := u.session != nil && u.session.Recording()
+	sess := u.session
+	recording := sess != nil && sess.Recording()
 	u.mu.Unlock()
+	if sess != nil {
+		if ms := sess.Lag().Milliseconds(); ms > 0 && ms < 10000 {
+			status = status + " · " + strconv.Itoa(int(ms)) + " ms behind the phone"
+		}
+	}
 
 	startLabel := "Start"
 	if live {

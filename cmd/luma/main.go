@@ -264,7 +264,7 @@ func (u *ui) beginMirror() {
 		if sess.Warning != "" {
 			u.status = sess.Warning
 		} else if sess.Smooth() {
-			u.status = "Live · 1080p cap · low delay. Click the screen and type."
+			u.status = "Live. Showing the newest frame. Click the screen and type."
 		} else {
 			u.status = "Connected."
 		}
