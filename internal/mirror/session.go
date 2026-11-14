@@ -341,17 +341,11 @@ func (s *Session) startSmooth() error {
 		return fmt.Errorf("could not copy the phone service: %w", err)
 	}
 	var first error
-	for _, opts := range []string{
-		// Every frame is its own keyframe, so a queued second of video can be skipped.
-		"profile:int=1,max-bframes:int=0,i-frame-interval:float=0,latency:int=0,priority:int=0,operating-rate:float=60,bitrate-mode:int=1,prepend-sps-pps-to-idr-frames:int=1,vendor.qti-ext-enc-low-latency.enable:int=1",
-		"max-bframes:int=0,i-frame-interval:float=0.1,latency:int=0,priority:int=0,operating-rate:float=60,bitrate-mode:int=1,vendor.qti-ext-enc-low-latency.enable:int=1",
-		"latency:int=0,priority:int=0,i-frame-interval:int=1,max-bframes:int=0",
-		"",
-	} {
+	for _, opts := range codecOptionTiers(s.q.FPS) {
 		err := s.tryLink(opts)
 		if err == nil {
 			if opts == "" {
-				s.Warning = "This phone rejected the low-delay encoder flags. The PC still shows the newest frame it has."
+				s.Warning = "This phone rejected the low-delay encoder flags. The picture still updates, but it may lag more."
 			}
 			return nil
 		}
@@ -362,6 +356,28 @@ func (s *Session) startSmooth() error {
 		first = fmt.Errorf("could not open the video stream")
 	}
 	return fmt.Errorf("%v", first)
+}
+
+func codecOptionTiers(fps int) []string {
+	if fps <= 0 {
+		fps = 60
+	}
+	// Repeat interval is in microseconds. One frame period keeps a still
+	// screen from freezing on the first picture.
+	repeatUS := 1000000 / fps
+	// Constrained Baseline, no B-frames, keyframe about once a second.
+	// All-intra (interval 0) makes every frame huge and slower, not faster.
+	// low-latency=1 is the Android 11 encoder flag; latency=0 is the frame count.
+	full := fmt.Sprintf(
+		"profile:int=65536,max-bframes:int=0,i-frame-interval:float=1,low-latency:int=1,latency:int=0,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d,vendor.qti-ext-enc-low-latency.enable:int=1",
+		fps, repeatUS,
+	)
+	mid := fmt.Sprintf(
+		"max-bframes:int=0,i-frame-interval:float=1,latency:int=0,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d",
+		fps, repeatUS,
+	)
+	basic := "max-bframes:int=0,latency:int=0,priority:int=0,low-latency:int=1"
+	return []string{full, mid, basic, ""}
 }
 
 func (s *Session) tryLink(opts string) error {
@@ -818,7 +834,6 @@ func (s *Session) spawnDecoder(w, h int, bsf bool) (io.WriteCloser, error) {
 		"-hide_banner", "-loglevel", "error",
 		"-fflags", "nobuffer+discardcorrupt+flush_packets",
 		"-flags", "+low_delay",
-		"-flags2", "+fast",
 		"-probesize", "32",
 		"-analyzeduration", "0",
 		"-fpsprobesize", "0",
@@ -826,17 +841,17 @@ func (s *Session) spawnDecoder(w, h int, bsf bool) (io.WriteCloser, error) {
 		"-avioflags", "direct",
 		"-seekable", "0",
 		"-thread_queue_size", "1",
-		"-threads", "4",
-		"-thread_type", "slice",
+		// One thread. Frame threading delays the picture by one frame per thread.
+		"-threads", "1",
 		"-f", "h264",
 	}
 	if bsf {
 		args = append(args, "-bsf:v", "h264_metadata=num_reorder_frames=0:max_dec_frame_buffering=1")
 	}
 	args = append(args,
-		"-framerate", "60",
 		"-i", "pipe:0",
 		"-an",
+		"-sws_flags", "fast_bilinear",
 		"-vsync", "0",
 		"-muxdelay", "0",
 		"-muxpreload", "0",

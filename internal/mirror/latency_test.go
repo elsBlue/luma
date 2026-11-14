@@ -1,6 +1,9 @@
 package mirror
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDisplayKeepsNewestKeyframe(t *testing.T) {
 	batch := []viewPkt{
@@ -19,6 +22,34 @@ func TestDisplayKeepsNewestKeyframe(t *testing.T) {
 		if string(got[i]) != w {
 			t.Fatalf("blob %d = %s", i, got[i])
 		}
+	}
+}
+
+func TestCodecOptionsAreLowDelayNotAllIntra(t *testing.T) {
+	tiers := codecOptionTiers(60)
+	if len(tiers) != 4 || tiers[3] != "" {
+		t.Fatalf("tiers = %#v", tiers)
+	}
+	full := tiers[0]
+	for _, want := range []string{
+		"profile:int=65536",
+		"max-bframes:int=0",
+		"i-frame-interval:float=1",
+		"low-latency:int=1",
+		"priority:int=0",
+		"operating-rate:int=60",
+		"repeat-previous-frame-after:long=16666",
+		"vendor.qti-ext-enc-low-latency.enable:int=1",
+	} {
+		if !strings.Contains(full, want) {
+			t.Fatalf("missing %s in %s", want, full)
+		}
+	}
+	if strings.Contains(full, "i-frame-interval:float=0,") || strings.HasSuffix(full, "i-frame-interval:float=0") {
+		t.Fatalf("all-intra must not be requested: %s", full)
+	}
+	if !strings.Contains(tiers[2], "low-latency:int=1") {
+		t.Fatalf("basic tier lost low-latency: %s", tiers[2])
 	}
 }
 
