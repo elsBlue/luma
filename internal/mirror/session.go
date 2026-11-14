@@ -368,7 +368,7 @@ func (s *Session) startSmooth() error {
 	}
 	var first error
 	tiers := codecOptionTiers(s.q.FPS)
-	names := []string{"full", "mid", "basic", "default"}
+	names := []string{"hw", "std", "basic", "default"}
 	for i, opts := range tiers {
 		err := s.tryLink(opts)
 		if err == nil {
@@ -397,22 +397,22 @@ func codecOptionTiers(fps int) []string {
 	if fps <= 0 {
 		fps = 60
 	}
-	// Repeat interval is in microseconds. One frame period keeps a still
-	// screen from freezing on the first picture.
-	repeatUS := 1000000 / fps
-	// Constrained Baseline, no B-frames, keyframe about once a second.
-	// All-intra (interval 0) makes every frame huge and slower, not faster.
-	// low-latency=1 is the Android 11 encoder flag; latency=0 is the frame count.
-	full := fmt.Sprintf(
-		"profile:int=65536,max-bframes:int=0,i-frame-interval:float=1,low-latency:int=1,latency:int=0,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d,vendor.qti-ext-enc-low-latency.enable:int=1",
+	// 100ms, same as a normal live encoder. Repeating every frame period
+	// injects duplicate pictures and makes motion look stepped.
+	repeatUS := 100000
+	// Keyframe every 10s. Every 1s the IDR is large enough to hitch the picture.
+	// No forced profile: Constrained Baseline can push the phone onto a slow
+	// software encoder, which sits around half a second and stutters.
+	hw := fmt.Sprintf(
+		"max-bframes:int=0,i-frame-interval:float=10,low-latency:int=1,latency:int=0,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d,vendor.qti-ext-enc-low-latency.enable:int=1",
 		fps, repeatUS,
 	)
-	mid := fmt.Sprintf(
-		"max-bframes:int=0,i-frame-interval:float=1,latency:int=0,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d",
+	std := fmt.Sprintf(
+		"max-bframes:int=0,i-frame-interval:float=10,low-latency:int=1,latency:int=0,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d",
 		fps, repeatUS,
 	)
 	basic := "max-bframes:int=0,latency:int=0,priority:int=0,low-latency:int=1"
-	return []string{full, mid, basic, ""}
+	return []string{hw, std, basic, ""}
 }
 
 func (s *Session) tryLink(opts string) error {
@@ -1061,6 +1061,15 @@ func (s *Session) spawnDecoder(w, h int, bsf bool) (io.WriteCloser, error) {
 	args = append(args,
 		"-i", "pipe:0",
 		"-an",
+	)
+	pw, ph := previewSize(w, h)
+	if pw != w || ph != h {
+		// The window shows the phone much smaller than 1080p. Decoding the
+		// full RGBA makes the PC fall behind, which queues about half a
+		// second and then skips pictures (the stepped look).
+		args = append(args, "-vf", fmt.Sprintf("scale=%d:%d:flags=fast_bilinear", pw, ph))
+	}
+	args = append(args,
 		"-sws_flags", "fast_bilinear",
 		"-vsync", "0",
 		"-muxdelay", "0",
@@ -1101,7 +1110,7 @@ func (s *Session) spawnDecoder(w, h int, bsf bool) (io.WriteCloser, error) {
 	s.mu.Lock()
 	s.ffCmd = ff
 	s.mu.Unlock()
-	go s.pumpRaw(stdout, w, h)
+	go s.pumpRaw(stdout, pw, ph)
 	return stdin, nil
 }
 
@@ -1357,6 +1366,36 @@ func cappedSize(n int) int {
 	return n
 }
 
+func previewSize(w, h int) (int, int) {
+	const maxLong = 1280
+	if w < 2 || h < 2 {
+		return w, h
+	}
+	long := w
+	if h > long {
+		long = h
+	}
+	if long <= maxLong {
+		return evenDim(w), evenDim(h)
+	}
+	nw := evenDim(w * maxLong / long)
+	nh := evenDim(h * maxLong / long)
+	if nw < 2 {
+		nw = 2
+	}
+	if nh < 2 {
+		nh = 2
+	}
+	return nw, nh
+}
+
+func evenDim(n int) int {
+	if n%2 != 0 {
+		return n - 1
+	}
+	return n
+}
+
 func tune(c net.Conn) {
 	tcp, ok := c.(*net.TCPConn)
 	if !ok {
@@ -1364,7 +1403,9 @@ func tune(c net.Conn) {
 	}
 	_ = tcp.SetNoDelay(true)
 	_ = tcp.SetKeepAlive(false)
-	_ = tcp.SetReadBuffer(256 * 1024)
+	// 256KB holds about a quarter second of 8Mbps video when the PC is
+	// briefly late. A smaller window pushes back instead of hiding delay.
+	_ = tcp.SetReadBuffer(64 * 1024)
 	_ = tcp.SetWriteBuffer(32 * 1024)
 }
 

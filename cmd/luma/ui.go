@@ -363,7 +363,11 @@ func (s *stage) layout(gtx layout.Context) layout.Dimensions {
 
 	stack := op.Offset(image.Pt(offX, offY)).Push(gtx.Ops)
 	aff := op.Affine(f32.Affine2D{}.Scale(f32.Point{}, f32.Pt(scale, scale))).Push(gtx.Ops)
-	paint.NewImageOp(img).Add(gtx.Ops)
+	// Nearest skips the mipmap chain. Building one for every phone frame
+	// is what made a smooth stream look stepped.
+	imgOp := paint.NewImageOp(img)
+	imgOp.Filter = paint.FilterNearest
+	imgOp.Add(gtx.Ops)
 	paint.PaintOp{}.Add(gtx.Ops)
 	aff.Pop()
 	stack.Pop()

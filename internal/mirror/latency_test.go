@@ -31,26 +31,46 @@ func TestCodecOptionsAreLowDelayNotAllIntra(t *testing.T) {
 	if len(tiers) != 4 || tiers[3] != "" {
 		t.Fatalf("tiers = %#v", tiers)
 	}
-	full := tiers[0]
+	hw := tiers[0]
 	for _, want := range []string{
-		"profile:int=65536",
 		"max-bframes:int=0",
-		"i-frame-interval:float=1",
+		"i-frame-interval:float=10",
 		"low-latency:int=1",
 		"priority:int=0",
 		"operating-rate:int=60",
-		"repeat-previous-frame-after:long=16666",
+		"repeat-previous-frame-after:long=100000",
 		"vendor.qti-ext-enc-low-latency.enable:int=1",
 	} {
-		if !strings.Contains(full, want) {
-			t.Fatalf("missing %s in %s", want, full)
+		if !strings.Contains(hw, want) {
+			t.Fatalf("missing %s in %s", want, hw)
 		}
 	}
-	if strings.Contains(full, "i-frame-interval:float=0,") || strings.HasSuffix(full, "i-frame-interval:float=0") {
-		t.Fatalf("all-intra must not be requested: %s", full)
+	if strings.Contains(hw, "profile:int=65536") {
+		t.Fatalf("forced baseline can leave the hardware encoder: %s", hw)
+	}
+	if strings.Contains(hw, "i-frame-interval:float=1,") || strings.Contains(hw, "i-frame-interval:float=0") {
+		t.Fatalf("keyframe every second (or all-intra) hitches the picture: %s", hw)
+	}
+	if strings.Contains(tiers[1], "vendor.qti-ext-enc-low-latency") {
+		t.Fatalf("std tier should drop the vendor flag: %s", tiers[1])
 	}
 	if !strings.Contains(tiers[2], "low-latency:int=1") {
 		t.Fatalf("basic tier lost low-latency: %s", tiers[2])
+	}
+}
+
+func TestPreviewFitsTheWindow(t *testing.T) {
+	w, h := previewSize(1080, 1920)
+	if w != 720 || h != 1280 {
+		t.Fatalf("portrait %dx%d", w, h)
+	}
+	w, h = previewSize(1920, 1080)
+	if w != 1280 || h != 720 {
+		t.Fatalf("landscape %dx%d", w, h)
+	}
+	w, h = previewSize(640, 360)
+	if w != 640 || h != 360 {
+		t.Fatalf("small %dx%d", w, h)
 	}
 }
 
