@@ -1,0 +1,21 @@
+Luma
+
+Copyright (c) 2026 Iqbal Hasan
+
+This program is licensed under the MIT License. See LICENSE.
+
+The on-phone capture service that Luma downloads and runs is scrcpy-server,
+from the scrcpy project:
+
+  Copyright (C) 2018-2026 Romain Vimont and contributors
+  https://github.com/Genymobile/scrcpy
+  Licensed under the Apache License, Version 2.0
+
+A copy of that license is in THIRD_PARTY_LICENSES/scrcpy-Apache-2.0.txt.
+
+Luma also downloads, on first launch or inside the Windows zip:
+
+  Android SDK Platform-Tools (adb), from Google
+  FFmpeg LGPL build, used only as a separate decoder program
+
+Those tools stay separate programs. Luma does not link them into Luma.exe.

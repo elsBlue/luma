@@ -1,0 +1,36 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+      - name: Build Luma.exe
+        run: go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/Luma.exe ./cmd/luma
+      - name: Bundle tools and zip
+        shell: pwsh
+        run: ./scripts/bundle.ps1
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view v1.0.0 >/dev/null 2>&1; then
+            gh release upload v1.0.0 dist/Luma.exe dist/Luma-Windows.zip --clobber
+          else
+            gh release create v1.0.0 dist/Luma.exe dist/Luma-Windows.zip \
+              --title "Luma 1.0.0 for Windows" \
+              --notes-file RELEASE.md
+          fi
