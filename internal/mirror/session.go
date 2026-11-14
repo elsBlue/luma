@@ -497,9 +497,9 @@ func shortEncoder(name string) string {
 }
 
 func (s *Session) openTiers(encoder string) error {
-	var first error
+	var last error
 	tiers := codecOptionTiers(s.q.FPS)
-	names := []string{"hw", "std", "basic", "default"}
+	names := []string{"default", "basic", "std", "hw"}
 	for i, opts := range tiers {
 		err := s.tryLink(opts, encoder)
 		if err == nil {
@@ -513,50 +513,56 @@ func (s *Session) openTiers(encoder string) error {
 				s.encoder = ""
 			}
 			s.mu.Unlock()
-			if opts == "" {
+			if opts == "" && i > 0 {
 				s.Warning = "This phone rejected the low-delay encoder flags. The picture still updates, but it may lag more."
 			}
 			return nil
 		}
-		first = err
+		last = err
 		s.tearStream()
+		if strings.Contains(err.Error(), "encoder stopped") {
+			select {
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			case <-time.After(1200 * time.Millisecond):
+			}
+		}
 	}
-	if first == nil {
-		first = fmt.Errorf("could not open the video stream")
+	if last == nil {
+		last = fmt.Errorf("could not open the video stream")
 	}
-	return fmt.Errorf("%v", first)
+	return fmt.Errorf("%v", last)
 }
 
 func codecOptionTiers(fps int) []string {
 	if fps <= 0 {
 		fps = 60
 	}
-	// 100ms, same as a normal live encoder. Repeating every frame period
-	// injects duplicate pictures and makes motion look stepped.
+	// The phone server already asks for one frame in, one frame out.
+	// Try that first. A vendor flag that the chip rejects can kill the
+	// encoder process, and then every later attempt dies with it.
 	repeatUS := 100000
-	// Keyframe every 10s. Every 1s the IDR is large enough to hitch the picture.
-	// No forced profile: Constrained Baseline can push the phone onto a slow
-	// software encoder, which sits around half a second and stutters.
-	// latency=1 is the smallest value Android will honor: one frame in,
-	// one frame out. 0 is ignored or treated as a deep buffer.
-	hw := fmt.Sprintf(
-		"max-bframes:int=0,i-frame-interval:float=10,low-latency:int=1,latency:int=1,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d,vendor.qti-ext-enc-low-latency.enable:int=1",
-		fps, repeatUS,
-	)
+	basic := "max-bframes:int=0,latency:int=1,priority:int=0,low-latency:int=1"
 	std := fmt.Sprintf(
 		"max-bframes:int=0,i-frame-interval:float=10,low-latency:int=1,latency:int=1,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d",
 		fps, repeatUS,
 	)
-	basic := "max-bframes:int=0,latency:int=1,priority:int=0,low-latency:int=1"
-	return []string{hw, std, basic, ""}
+	hw := std + ",vendor.qti-ext-enc-low-latency.enable:int=1"
+	return []string{"", basic, std, hw}
 }
 
 func (s *Session) tryLink(opts, encoder string) error {
-	if err := s.stream(false, opts, encoder); err != nil {
-		s.tearStream()
-		return s.stream(true, opts, encoder)
+	err := s.stream(false, opts, encoder)
+	if err == nil {
+		return nil
 	}
-	return nil
+	// The tunnel worked and the encoder process died. A second tunnel
+	// will not bring that process back.
+	if strings.Contains(err.Error(), "encoder stopped") || strings.Contains(err.Error(), "no picture") || strings.Contains(err.Error(), "no device name") {
+		return err
+	}
+	s.tearStream()
+	return s.stream(true, opts, encoder)
 }
 
 func (s *Session) stream(forward bool, opts, encoder string) error {
@@ -605,8 +611,9 @@ func (s *Session) stream(forward bool, opts, encoder string) error {
 	s.shell = shell
 	s.mu.Unlock()
 	shellDone := make(chan struct{})
+	var logs tailLog
 	go func() {
-		_, _ = io.Copy(io.Discard, stdout)
+		_, _ = io.Copy(&logs, stdout)
 		close(shellDone)
 	}()
 
@@ -620,7 +627,7 @@ func (s *Session) stream(forward bool, opts, encoder string) error {
 		if err != nil {
 			select {
 			case <-shellDone:
-				return fmt.Errorf("phone encoder stopped")
+				return logs.stopped()
 			default:
 				return fmt.Errorf("no handshake: %w", err)
 			}
@@ -664,7 +671,7 @@ func (s *Session) stream(forward bool, opts, encoder string) error {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	case <-shellDone:
-		return fmt.Errorf("phone encoder stopped")
+		return logs.stopped()
 	case <-time.After(8 * time.Second):
 		s.mu.Lock()
 		ok := s.frame.Image != nil
@@ -1515,6 +1522,65 @@ func freePort() (int, error) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 	return port, nil
+}
+
+type tailLog struct {
+	mu sync.Mutex
+	b  []byte
+}
+
+func (t *tailLog) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	t.b = append(t.b, p...)
+	if len(t.b) > 6000 {
+		t.b = append([]byte(nil), t.b[len(t.b)-3000:]...)
+	}
+	t.mu.Unlock()
+	return len(p), nil
+}
+
+func (t *tailLog) stopped() error {
+	if why := encoderReason(t.text()); why != "" {
+		return fmt.Errorf("phone encoder stopped: %s", why)
+	}
+	return fmt.Errorf("phone encoder stopped")
+}
+
+func (t *tailLog) text() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.b)
+}
+
+func encoderReason(s string) string {
+	var best string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "at ") || strings.HasPrefix(line, "...") {
+			continue
+		}
+		low := strings.ToLower(line)
+		if strings.Contains(low, "error") || strings.Contains(low, "exception") || strings.Contains(low, "fatal") || strings.Contains(low, "caused by") {
+			best = line
+		}
+	}
+	if best == "" {
+		lines := strings.Split(s, "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if line != "" && !strings.HasPrefix(line, "at ") {
+				best = line
+				break
+			}
+		}
+	}
+	for _, prefix := range []string{"[server] ERROR: ", "[server] INFO: ", "[server] WARN: ", "ERROR: ", "INFO: "} {
+		best = strings.TrimPrefix(best, prefix)
+	}
+	if len(best) > 140 {
+		best = best[:140]
+	}
+	return best
 }
 
 func dialHandshake(ctx context.Context, port int, deadline time.Time) (net.Conn, error) {

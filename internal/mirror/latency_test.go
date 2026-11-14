@@ -30,10 +30,10 @@ func TestDisplayKeepsNewestKeyframe(t *testing.T) {
 
 func TestCodecOptionsAreLowDelayNotAllIntra(t *testing.T) {
 	tiers := codecOptionTiers(60)
-	if len(tiers) != 4 || tiers[3] != "" {
+	if len(tiers) != 4 || tiers[0] != "" {
 		t.Fatalf("tiers = %#v", tiers)
 	}
-	hw := tiers[0]
+	hw := tiers[3]
 	for _, want := range []string{
 		"max-bframes:int=0",
 		"i-frame-interval:float=10",
@@ -59,11 +59,19 @@ func TestCodecOptionsAreLowDelayNotAllIntra(t *testing.T) {
 	if strings.Contains(hw, "i-frame-interval:float=1,") || strings.Contains(hw, "i-frame-interval:float=0") {
 		t.Fatalf("keyframe every second (or all-intra) hitches the picture: %s", hw)
 	}
-	if strings.Contains(tiers[1], "vendor.qti-ext-enc-low-latency") {
-		t.Fatalf("std tier should drop the vendor flag: %s", tiers[1])
+	if strings.Contains(tiers[1], "vendor.qti-ext-enc-low-latency") || strings.Contains(tiers[2], "vendor.qti-ext-enc-low-latency") {
+		t.Fatalf("vendor flag must stay on the last tier: %#v", tiers)
 	}
-	if !strings.Contains(tiers[2], "low-latency:int=1") {
-		t.Fatalf("basic tier lost low-latency: %s", tiers[2])
+	if !strings.Contains(tiers[1], "low-latency:int=1") {
+		t.Fatalf("basic tier lost low-latency: %s", tiers[1])
+	}
+}
+
+func TestEncoderReasonPicksTheErrorLine(t *testing.T) {
+	log := "[server] INFO: Recording...\n[server] ERROR: Capture/encoding error: java.lang.IllegalArgumentException: encoder died\n\tat android.media.MediaCodec.configure\n"
+	got := encoderReason(log)
+	if !strings.Contains(got, "IllegalArgumentException") || strings.Contains(got, "[server]") {
+		t.Fatalf("%q", got)
 	}
 }
 
