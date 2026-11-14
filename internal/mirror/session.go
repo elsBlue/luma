@@ -83,6 +83,7 @@ type Session struct {
 	lag      time.Duration
 
 	tier      string
+	encoder   string
 	usbWait   time.Duration
 	decQ      []time.Time
 	decLast   time.Duration
@@ -360,17 +361,158 @@ func (s *Session) rememberLink(forward bool, spec string) {
 	s.mu.Unlock()
 }
 
+func (s *Session) pickEncoder(ctx context.Context) string {
+	cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	cmd := fmt.Sprintf(
+		"CLASSPATH=/data/local/tmp/luma-server.jar app_process / com.genymobile.scrcpy.Server %s log_level=info list_encoders=true",
+		proto.ServerVersion,
+	)
+	out, _ := s.adb.Shell(cctx, s.serial, cmd)
+	name := chooseH264Encoder(out)
+	s.mu.Lock()
+	s.encoder = shortEncoder(name)
+	s.mu.Unlock()
+	return name
+}
+
+func chooseH264Encoder(log string) string {
+	var cands []string
+	for _, line := range strings.Split(log, "\n") {
+		if fieldAfter(line, "video-codec=") != "h264" {
+			continue
+		}
+		name := fieldAfter(line, "video-encoder=")
+		if name == "" || !safeEncoderName(name) || strings.Contains(strings.ToLower(line), "alias for") {
+			continue
+		}
+		if softwareEncoder(name) || strings.Contains(line, "(sw)") {
+			continue
+		}
+		if strings.Contains(line, "(hw)") || strings.Contains(line, "(hybrid)") || hardwareEncoder(name) {
+			cands = append(cands, name)
+		}
+	}
+	if len(cands) == 0 {
+		return ""
+	}
+	best := cands[0]
+	for _, name := range cands[1:] {
+		if encoderScore(name) > encoderScore(best) {
+			best = name
+		}
+	}
+	return best
+}
+
+func fieldAfter(line, key string) string {
+	i := strings.Index(line, key)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(key):]
+	end := strings.IndexAny(rest, " \t\r")
+	if end < 0 {
+		return rest
+	}
+	return rest[:end]
+}
+
+func safeEncoderName(name string) bool {
+	if name == "" || len(name) > 80 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func softwareEncoder(name string) bool {
+	n := strings.ToLower(name)
+	return strings.Contains(n, "omx.google") || strings.Contains(n, "c2.android") || strings.Contains(n, "c2.google")
+}
+
+func hardwareEncoder(name string) bool {
+	n := strings.ToLower(name)
+	for _, k := range []string{"qti", "qcom", "exynos", "mtk", "mediatek", ".sec", "samsung", "unisoc", "sprd", "hisi", "amlogic", "nvidia", "v4l2"} {
+		if strings.Contains(n, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func encoderScore(name string) int {
+	n := strings.ToLower(name)
+	score := 10
+	switch {
+	case strings.Contains(n, "qti") || strings.Contains(n, "qcom"):
+		score = 80
+	case strings.Contains(n, "exynos") || strings.Contains(n, ".sec"):
+		score = 70
+	case strings.Contains(n, "mtk") || strings.Contains(n, "mediatek"):
+		score = 70
+	case strings.Contains(n, "unisoc") || strings.Contains(n, "sprd"):
+		score = 60
+	}
+	if strings.HasPrefix(n, "c2.") {
+		score += 5
+	}
+	if strings.Contains(n, "lowlatency") || strings.Contains(n, "low_latency") {
+		score += 15
+	}
+	if strings.Contains(n, "secure") {
+		score -= 20
+	}
+	return score
+}
+
+func shortEncoder(name string) string {
+	n := strings.ToLower(name)
+	switch {
+	case name == "":
+		return ""
+	case strings.Contains(n, "qti") || strings.Contains(n, "qcom"):
+		return "qcom"
+	case strings.Contains(n, "mtk") || strings.Contains(n, "mediatek"):
+		return "mtk"
+	case strings.Contains(n, "exynos"):
+		return "exynos"
+	case strings.Contains(n, ".sec"):
+		return "sec"
+	}
+	if len(name) > 18 {
+		return name[:18]
+	}
+	return name
+}
+
 func (s *Session) startSmooth() error {
 	ctx, cancel := context.WithTimeout(s.ctx, 45*time.Second)
 	defer cancel()
 	if err := s.adb.Push(ctx, s.serial, s.server, "/data/local/tmp/luma-server.jar"); err != nil {
 		return fmt.Errorf("could not copy the phone service: %w", err)
 	}
+	enc := s.pickEncoder(ctx)
+	err := s.openTiers(enc)
+	if err != nil && enc != "" && ctx.Err() == nil {
+		s.tearStream()
+		err = s.openTiers("")
+	}
+	return err
+}
+
+func (s *Session) openTiers(encoder string) error {
 	var first error
 	tiers := codecOptionTiers(s.q.FPS)
 	names := []string{"hw", "std", "basic", "default"}
 	for i, opts := range tiers {
-		err := s.tryLink(opts)
+		err := s.tryLink(opts, encoder)
 		if err == nil {
 			name := "default"
 			if i < len(names) {
@@ -378,6 +520,9 @@ func (s *Session) startSmooth() error {
 			}
 			s.mu.Lock()
 			s.tier = name
+			if encoder == "" {
+				s.encoder = ""
+			}
 			s.mu.Unlock()
 			if opts == "" {
 				s.Warning = "This phone rejected the low-delay encoder flags. The picture still updates, but it may lag more."
@@ -403,27 +548,29 @@ func codecOptionTiers(fps int) []string {
 	// Keyframe every 10s. Every 1s the IDR is large enough to hitch the picture.
 	// No forced profile: Constrained Baseline can push the phone onto a slow
 	// software encoder, which sits around half a second and stutters.
+	// latency=1 is the smallest value Android will honor: one frame in,
+	// one frame out. 0 is ignored or treated as a deep buffer.
 	hw := fmt.Sprintf(
-		"max-bframes:int=0,i-frame-interval:float=10,low-latency:int=1,latency:int=0,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d,vendor.qti-ext-enc-low-latency.enable:int=1",
+		"max-bframes:int=0,i-frame-interval:float=10,low-latency:int=1,latency:int=1,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d,vendor.qti-ext-enc-low-latency.enable:int=1",
 		fps, repeatUS,
 	)
 	std := fmt.Sprintf(
-		"max-bframes:int=0,i-frame-interval:float=10,low-latency:int=1,latency:int=0,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d",
+		"max-bframes:int=0,i-frame-interval:float=10,low-latency:int=1,latency:int=1,priority:int=0,operating-rate:int=%d,repeat-previous-frame-after:long=%d",
 		fps, repeatUS,
 	)
-	basic := "max-bframes:int=0,latency:int=0,priority:int=0,low-latency:int=1"
+	basic := "max-bframes:int=0,latency:int=1,priority:int=0,low-latency:int=1"
 	return []string{hw, std, basic, ""}
 }
 
-func (s *Session) tryLink(opts string) error {
-	if err := s.stream(false, opts); err != nil {
+func (s *Session) tryLink(opts, encoder string) error {
+	if err := s.stream(false, opts, encoder); err != nil {
 		s.tearStream()
-		return s.stream(true, opts)
+		return s.stream(true, opts, encoder)
 	}
 	return nil
 }
 
-func (s *Session) stream(forward bool, opts string) error {
+func (s *Session) stream(forward bool, opts, encoder string) error {
 	scid, socket := newSCID()
 	port, err := freePort()
 	if err != nil {
@@ -450,13 +597,16 @@ func (s *Session) stream(forward bool, opts string) error {
 		}
 		s.rememberLink(false, spec)
 	}
-	codec := ""
+	extra := ""
 	if opts != "" {
-		codec = " video_codec_options=" + opts
+		extra += " video_codec_options=" + opts
+	}
+	if encoder != "" {
+		extra += " video_encoder=" + encoder
 	}
 	cmdLine := fmt.Sprintf(
 		"CLASSPATH=/data/local/tmp/luma-server.jar app_process / com.genymobile.scrcpy.Server %s scid=%s log_level=info tunnel_forward=%t audio=false control=true video=true video_codec=h264 max_size=%d max_fps=%d video_bit_rate=%d stay_awake=true power_on=true send_frame_meta=true send_codec_meta=true send_device_meta=true%s",
-		proto.ServerVersion, scid, forward, cappedSize(s.q.MaxSize), s.q.FPS, s.q.Bitrate, codec,
+		proto.ServerVersion, scid, forward, cappedSize(s.q.MaxSize), s.q.FPS, s.q.Bitrate, extra,
 	)
 	shell, stdout, err := s.adb.StartShell(ctx, s.serial, cmdLine)
 	if err != nil {
@@ -800,7 +950,7 @@ func (s *Session) maybeLogLocked(now time.Time) {
 	if s.tier == "capture" {
 		path = "capture"
 	}
-	fmt.Fprintf(s.logf, "%s path=%s %dx%d fps=%d usb=%d usbMax=%d decode=%d screen=%d clock=%d queue=%d tier=%s shot=%d sent=%d\n",
+	fmt.Fprintf(s.logf, "%s path=%s %dx%d fps=%d usb=%d usbMax=%d decode=%d screen=%d clock=%d queue=%d tier=%s enc=%s shot=%d sent=%d\n",
 		now.Format("15:04:05"),
 		path,
 		s.videoW, s.videoH,
@@ -812,6 +962,7 @@ func (s *Session) maybeLogLocked(now time.Time) {
 		s.lag.Milliseconds(),
 		len(s.decQ),
 		s.tier,
+		s.encoder,
 		s.shot.Milliseconds(),
 		s.sentN,
 	)
@@ -866,6 +1017,9 @@ func (s *Session) TraceLine() (string, string) {
 	tier := s.tier
 	if tier == "" {
 		tier = "video"
+	}
+	if s.encoder != "" {
+		tier = tier + " " + s.encoder
 	}
 	line := fmt.Sprintf("%d fps · usb %dms · decode %dms · screen %dms · clock %dms · %s",
 		fps, s.usbWait.Milliseconds(), s.decLast.Milliseconds(), screen.Milliseconds(), s.lag.Milliseconds(), tier)
@@ -1029,14 +1183,24 @@ func timedOut(err error) bool {
 }
 
 func (s *Session) startRawDecoder(w, h int) (io.WriteCloser, error) {
-	in, err := s.spawnDecoder(w, h, true)
-	if err != nil {
-		return s.spawnDecoder(w, h, false)
+	var last error
+	for _, filter := range []string{
+		// Filler NALs are bitrate padding. Reorder fields exist only on newer
+		// ffmpeg; a build that rejects them exits at once and the next filter is used.
+		"h264_metadata=delete_filler=1:num_reorder_frames=0:max_dec_frame_buffering=1",
+		"h264_metadata=delete_filler=1",
+		"",
+	} {
+		in, err := s.spawnDecoder(w, h, filter)
+		if err == nil {
+			return in, nil
+		}
+		last = err
 	}
-	return in, nil
+	return nil, last
 }
 
-func (s *Session) spawnDecoder(w, h int, bsf bool) (io.WriteCloser, error) {
+func (s *Session) spawnDecoder(w, h int, filter string) (io.WriteCloser, error) {
 	if w < 2 || h < 2 || w > 1920 || h > 1920 {
 		return nil, fmt.Errorf("frame %dx%d is outside the 1080p cap", w, h)
 	}
@@ -1055,8 +1219,8 @@ func (s *Session) spawnDecoder(w, h int, bsf bool) (io.WriteCloser, error) {
 		"-thread_type", "slice",
 		"-f", "h264",
 	}
-	if bsf {
-		args = append(args, "-bsf:v", "h264_metadata=num_reorder_frames=0:max_dec_frame_buffering=1")
+	if filter != "" {
+		args = append(args, "-bsf:v", filter)
 	}
 	args = append(args,
 		"-i", "pipe:0",

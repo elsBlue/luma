@@ -45,6 +45,12 @@ func TestCodecOptionsAreLowDelayNotAllIntra(t *testing.T) {
 			t.Fatalf("missing %s in %s", want, hw)
 		}
 	}
+	if strings.Contains(hw, "latency:int=0") {
+		t.Fatalf("latency 0 is not a real minimum: %s", hw)
+	}
+	if !strings.Contains(hw, ",latency:int=1,") {
+		t.Fatalf("missing one-frame latency: %s", hw)
+	}
 	if strings.Contains(hw, "profile:int=65536") {
 		t.Fatalf("forced baseline can leave the hardware encoder: %s", hw)
 	}
@@ -56,6 +62,30 @@ func TestCodecOptionsAreLowDelayNotAllIntra(t *testing.T) {
 	}
 	if !strings.Contains(tiers[2], "low-latency:int=1") {
 		t.Fatalf("basic tier lost low-latency: %s", tiers[2])
+	}
+}
+
+func TestChooseHardwareH264Encoder(t *testing.T) {
+	log := `
+[server] INFO: List of video encoders:
+    --video-codec=h264 --video-encoder=c2.android.avc.encoder (sw)
+    --video-codec=h264 --video-encoder=OMX.google.h264.encoder (sw)
+    --video-codec=h264 --video-encoder=OMX.qcom.video.encoder.avc (hw) [vendor]
+    --video-codec=h264 --video-encoder=c2.qti.avc.encoder (hw) [vendor]
+    --video-codec=h264 --video-encoder=c2.qti.avc.encoder.secure (hw) [vendor] (alias for c2.qti.avc.encoder)
+    --video-codec=h265 --video-encoder=c2.qti.hevc.encoder (hw) [vendor]
+`
+	if got := chooseH264Encoder(log); got != "c2.qti.avc.encoder" {
+		t.Fatalf("got %q", got)
+	}
+	if got := chooseH264Encoder("    --video-codec=h264 --video-encoder=OMX.MTK.VIDEO.ENCODER.AVC\n"); got != "OMX.MTK.VIDEO.ENCODER.AVC" {
+		t.Fatalf("untagged mtk %q", got)
+	}
+	if got := chooseH264Encoder("    --video-codec=h264 --video-encoder=c2.android.avc.encoder (sw)\n"); got != "" {
+		t.Fatalf("software should not be forced: %q", got)
+	}
+	if shortEncoder("c2.qti.avc.encoder") != "qcom" || shortEncoder("OMX.MTK.VIDEO.ENCODER.AVC") != "mtk" {
+		t.Fatal("short name")
 	}
 }
 
