@@ -84,6 +84,7 @@ type Session struct {
 
 	tier      string
 	encoder   string
+	fail      string
 	usbWait   time.Duration
 	decQ      []time.Time
 	decLast   time.Duration
@@ -124,6 +125,7 @@ func Start(parent context.Context, client *adb.Client, serial, ffmpeg, server st
 		s.Warning = "Smooth video unavailable (" + trimErr(err) + "). Using a slower compatible capture."
 		s.mu.Lock()
 		s.tier = "capture"
+		s.fail = trimErr(err)
 		s.mu.Unlock()
 		if err2 := s.startCompat(); err2 != nil {
 			s.Stop()
@@ -361,21 +363,23 @@ func (s *Session) rememberLink(forward bool, spec string) {
 	s.mu.Unlock()
 }
 
-func (s *Session) pickEncoder(ctx context.Context) string {
-	cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+func (s *Session) killServer() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := fmt.Sprintf(
-		"CLASSPATH=/data/local/tmp/luma-server.jar app_process / com.genymobile.scrcpy.Server %s log_level=info list_encoders=true",
-		proto.ServerVersion,
-	)
-	out, _ := s.adb.Shell(cctx, s.serial, cmd)
-	name := chooseH264Encoder(out)
-	s.mu.Lock()
-	s.encoder = shortEncoder(name)
-	s.mu.Unlock()
-	return name
+	_, _ = s.adb.Shell(ctx, s.serial, "pkill -f luma-server.jar")
 }
 
+func (s *Session) startSmooth() error {
+	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+	defer cancel()
+	if err := s.adb.Push(ctx, s.serial, s.server, "/data/local/tmp/luma-server.jar"); err != nil {
+		return fmt.Errorf("could not copy the phone service: %w", err)
+	}
+	// A named encoder that the phone rejects used to burn the whole startup
+	// and leave Luma on screencap (~700ms). Let the phone choose the encoder.
+	s.killServer()
+	return s.openTiers("")
+}
 func chooseH264Encoder(log string) string {
 	var cands []string
 	for _, line := range strings.Split(log, "\n") {
@@ -492,21 +496,6 @@ func shortEncoder(name string) string {
 	return name
 }
 
-func (s *Session) startSmooth() error {
-	ctx, cancel := context.WithTimeout(s.ctx, 45*time.Second)
-	defer cancel()
-	if err := s.adb.Push(ctx, s.serial, s.server, "/data/local/tmp/luma-server.jar"); err != nil {
-		return fmt.Errorf("could not copy the phone service: %w", err)
-	}
-	enc := s.pickEncoder(ctx)
-	err := s.openTiers(enc)
-	if err != nil && enc != "" && ctx.Err() == nil {
-		s.tearStream()
-		err = s.openTiers("")
-	}
-	return err
-}
-
 func (s *Session) openTiers(encoder string) error {
 	var first error
 	tiers := codecOptionTiers(s.q.FPS)
@@ -571,6 +560,7 @@ func (s *Session) tryLink(opts, encoder string) error {
 }
 
 func (s *Session) stream(forward bool, opts, encoder string) error {
+	s.killServer()
 	scid, socket := newSCID()
 	port, err := freePort()
 	if err != nil {
@@ -677,6 +667,12 @@ func (s *Session) stream(forward bool, opts, encoder string) error {
 		ok := s.frame.Image != nil
 		s.mu.Unlock()
 		if !ok {
+			s.mu.Lock()
+			why := s.fail
+			s.mu.Unlock()
+			if why != "" {
+				return fmt.Errorf("no picture arrived: %s", why)
+			}
 			return fmt.Errorf("no picture arrived")
 		}
 	case <-s.waitFrame(8 * time.Second):
@@ -744,6 +740,9 @@ func (s *Session) pumpVideo(r net.Conn) {
 					if dec == nil {
 						in, err := s.startRawDecoder(item.header.Width, item.header.Height)
 						if err != nil {
+							s.mu.Lock()
+							s.fail = trimErr(err)
+							s.mu.Unlock()
 							return
 						}
 						dec = in
@@ -1004,7 +1003,11 @@ func (s *Session) TraceLine() (string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.tier == "capture" {
-		return fmt.Sprintf("slow capture · shot %dms", s.shot.Milliseconds()), s.logPath
+		line := fmt.Sprintf("slow capture · shot %dms", s.shot.Milliseconds())
+		if s.fail != "" {
+			line += " · " + s.fail
+		}
+		return line, s.logPath
 	}
 	screen := time.Duration(0)
 	if !s.frameAt.IsZero() {
@@ -1183,24 +1186,32 @@ func timedOut(err error) bool {
 }
 
 func (s *Session) startRawDecoder(w, h int) (io.WriteCloser, error) {
-	var last error
-	for _, filter := range []string{
+	pw, ph := previewSize(w, h)
+	scales := []bool{false}
+	if pw != w || ph != h {
+		scales = []bool{true, false}
+	}
+	filters := []string{
 		// Filler NALs are bitrate padding. Reorder fields exist only on newer
 		// ffmpeg; a build that rejects them exits at once and the next filter is used.
 		"h264_metadata=delete_filler=1:num_reorder_frames=0:max_dec_frame_buffering=1",
 		"h264_metadata=delete_filler=1",
 		"",
-	} {
-		in, err := s.spawnDecoder(w, h, filter)
-		if err == nil {
-			return in, nil
+	}
+	var last error
+	for _, scaled := range scales {
+		for _, filter := range filters {
+			in, err := s.spawnDecoder(w, h, filter, scaled)
+			if err == nil {
+				return in, nil
+			}
+			last = err
 		}
-		last = err
 	}
 	return nil, last
 }
 
-func (s *Session) spawnDecoder(w, h int, filter string) (io.WriteCloser, error) {
+func (s *Session) spawnDecoder(w, h int, filter string, scaled bool) (io.WriteCloser, error) {
 	if w < 2 || h < 2 || w > 1920 || h > 1920 {
 		return nil, fmt.Errorf("frame %dx%d is outside the 1080p cap", w, h)
 	}
@@ -1227,11 +1238,13 @@ func (s *Session) spawnDecoder(w, h int, filter string) (io.WriteCloser, error) 
 		"-an",
 	)
 	pw, ph := previewSize(w, h)
-	if pw != w || ph != h {
+	if scaled && (pw != w || ph != h) {
 		// The window shows the phone much smaller than 1080p. Decoding the
 		// full RGBA makes the PC fall behind, which queues about half a
 		// second and then skips pictures (the stepped look).
 		args = append(args, "-vf", fmt.Sprintf("scale=%d:%d:flags=fast_bilinear", pw, ph))
+	} else {
+		pw, ph = w, h
 	}
 	args = append(args,
 		"-sws_flags", "fast_bilinear",
