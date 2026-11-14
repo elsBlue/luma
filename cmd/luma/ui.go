@@ -7,7 +7,6 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"gioui.org/app"
@@ -179,10 +178,10 @@ func (u *ui) sideBody(gtx layout.Context) layout.Dimensions {
 	sess := u.session
 	recording := sess != nil && sess.Recording()
 	u.mu.Unlock()
+	trace := ""
+	logPath := ""
 	if sess != nil {
-		if ms := sess.Lag().Milliseconds(); ms > 0 && ms < 10000 {
-			status = status + " · " + strconv.Itoa(int(ms)) + " ms behind the phone"
-		}
+		trace, logPath = sess.TraceLine()
 	}
 
 	startLabel := "Start"
@@ -303,6 +302,20 @@ func (u *ui) sideBody(gtx layout.Context) layout.Dimensions {
 			return l.Layout(gtx)
 		}),
 	)
+	if trace != "" {
+		kids = append(kids, rigid(6), layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			l := material.Label(u.th, unit.Sp(12), trace)
+			l.Color = colMute
+			return l.Layout(gtx)
+		}))
+	}
+	if logPath != "" {
+		kids = append(kids, rigid(4), layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			l := material.Label(u.th, unit.Sp(11), logPath)
+			l.Color = colMute
+			return l.Layout(gtx)
+		}))
+	}
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, kids...)
 }
 

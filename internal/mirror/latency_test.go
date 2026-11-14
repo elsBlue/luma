@@ -3,6 +3,7 @@ package mirror
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDisplayKeepsNewestKeyframe(t *testing.T) {
@@ -62,5 +63,49 @@ func TestDisplayAllIntraDropsOlder(t *testing.T) {
 	got := displayBlobs(batch)
 	if len(got) != 1 || string(got[0]) != "c" {
 		t.Fatalf("%q", got)
+	}
+}
+
+func TestPictureCountIgnoresConfigAndDropped(t *testing.T) {
+	batch := []viewPkt{
+		{config: true, blob: []byte("sps")},
+		{key: true, blob: []byte("k1")},
+		{blob: []byte("p1")},
+		{key: true, blob: []byte("k2")},
+		{blob: []byte("p2")},
+	}
+	show := displayBlobs(batch)
+	if pictureCount(show, batch) != 2 {
+		t.Fatalf("pics=%d show=%d", pictureCount(show, batch), len(show))
+	}
+	all := []viewPkt{
+		{key: true, blob: []byte("a")},
+		{key: true, blob: []byte("b")},
+		{key: true, blob: []byte("c")},
+	}
+	show = displayBlobs(all)
+	if pictureCount(show, all) != 1 {
+		t.Fatalf("all-intra pics=%d", pictureCount(show, all))
+	}
+}
+
+func TestDecodeTimingMatchesPictures(t *testing.T) {
+	s := &Session{logAt: time.Now()}
+	s.noteDecodeSend(2)
+	s.noteDecodeDone(false)
+	if s.decLast < 0 {
+		t.Fatal("decode time")
+	}
+	s.noteDecodeDone(true)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.decQ) != 0 {
+		t.Fatalf("queue %d", len(s.decQ))
+	}
+	if s.fpsN != 1 {
+		t.Fatalf("fpsN %d", s.fpsN)
+	}
+	if s.sentN != 2 {
+		t.Fatalf("sent %d", s.sentN)
 	}
 }

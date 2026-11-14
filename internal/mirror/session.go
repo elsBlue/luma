@@ -82,6 +82,22 @@ type Session struct {
 	wallBase time.Time
 	lag      time.Duration
 
+	tier      string
+	usbWait   time.Duration
+	decQ      []time.Time
+	decLast   time.Duration
+	frameAt   time.Time
+	fps       int
+	fpsN      int
+	fpsT      time.Time
+	shot      time.Duration
+	usbMax    time.Duration
+	sentN     int
+	logf      *os.File
+	logPath   string
+	logAt     time.Time
+	logClosed bool
+
 	jobs    chan func()
 	on      func()
 	Warning string
@@ -105,6 +121,9 @@ func Start(parent context.Context, client *adb.Client, serial, ffmpeg, server st
 	if err != nil {
 		s.tearStream()
 		s.Warning = "Smooth video unavailable (" + trimErr(err) + "). Using a slower compatible capture."
+		s.mu.Lock()
+		s.tier = "capture"
+		s.mu.Unlock()
 		if err2 := s.startCompat(); err2 != nil {
 			s.Stop()
 			return nil, fmt.Errorf("%v", err2)
@@ -134,6 +153,13 @@ func (s *Session) Stop() {
 		s.cancel()
 		s.stopRecord()
 		s.tearStream()
+		s.mu.Lock()
+		s.logClosed = true
+		if s.logf != nil {
+			_ = s.logf.Close()
+			s.logf = nil
+		}
+		s.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_, _ = s.adb.Shell(ctx, s.serial, "pkill -f luma-server.jar")
 		cancel()
@@ -341,9 +367,18 @@ func (s *Session) startSmooth() error {
 		return fmt.Errorf("could not copy the phone service: %w", err)
 	}
 	var first error
-	for _, opts := range codecOptionTiers(s.q.FPS) {
+	tiers := codecOptionTiers(s.q.FPS)
+	names := []string{"full", "mid", "basic", "default"}
+	for i, opts := range tiers {
 		err := s.tryLink(opts)
 		if err == nil {
+			name := "default"
+			if i < len(names) {
+				name = names[i]
+			}
+			s.mu.Lock()
+			s.tier = name
+			s.mu.Unlock()
 			if opts == "" {
 				s.Warning = "This phone rejected the low-delay encoder flags. The picture still updates, but it may lag more."
 			}
@@ -540,11 +575,14 @@ func (s *Session) pumpVideo(r net.Conn) {
 		}
 	}()
 	var priming [][]byte
+	var primingPics int
 	for s.ctx.Err() == nil {
 		batch, err := s.readCatchUp(sr)
 		if err != nil || len(batch) == 0 {
 			return
 		}
+		s.noteUSB(sr.wait)
+		sr.wait = 0
 		var recBlobs [][]byte
 		var view []viewPkt
 		for _, item := range batch {
@@ -562,7 +600,9 @@ func (s *Session) pumpVideo(r net.Conn) {
 						for _, blob := range priming {
 							writeLive(dec, blob)
 						}
+						s.noteDecodeSend(primingPics)
 						priming = nil
+						primingPics = 0
 					}
 				}
 				continue
@@ -580,8 +620,10 @@ func (s *Session) pumpVideo(r net.Conn) {
 			view = append(view, viewPkt{config: item.header.Config, key: item.header.Key && !item.header.Config, blob: blob})
 		}
 		show := displayBlobs(view)
+		pics := pictureCount(show, view)
 		if dec == nil {
 			priming = append(priming, show...)
+			primingPics += pics
 			if len(priming) > 48 {
 				return
 			}
@@ -590,6 +632,7 @@ func (s *Session) pumpVideo(r net.Conn) {
 		for _, blob := range show {
 			writeLive(dec, blob)
 		}
+		s.noteDecodeSend(pics)
 		s.mu.Lock()
 		rec := s.recIn
 		s.mu.Unlock()
@@ -687,6 +730,167 @@ func (s *Session) Lag() time.Duration {
 	return s.lag
 }
 
+func (s *Session) noteUSB(d time.Duration) {
+	s.mu.Lock()
+	s.usbWait = d
+	if d > s.usbMax {
+		s.usbMax = d
+	}
+	s.mu.Unlock()
+}
+
+func (s *Session) noteDecodeSend(n int) {
+	if n <= 0 {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	for i := 0; i < n; i++ {
+		s.decQ = append(s.decQ, now)
+	}
+	if len(s.decQ) > 180 {
+		s.decQ = append([]time.Time(nil), s.decQ[len(s.decQ)-180:]...)
+	}
+	s.sentN += n
+	s.mu.Unlock()
+}
+
+func (s *Session) noteDecodeDone(shown bool) {
+	now := time.Now()
+	s.mu.Lock()
+	if len(s.decQ) > 0 {
+		s.decLast = now.Sub(s.decQ[0])
+		s.decQ = s.decQ[1:]
+	}
+	if shown {
+		s.frameAt = now
+		if s.fpsT.IsZero() {
+			s.fpsT = now
+		}
+		s.fpsN++
+		if now.Sub(s.fpsT) >= time.Second {
+			s.fps = s.fpsN
+			s.fpsN = 0
+			s.fpsT = now
+		}
+	}
+	s.maybeLogLocked(now)
+	s.mu.Unlock()
+}
+
+func (s *Session) maybeLogLocked(now time.Time) {
+	if s.logClosed {
+		return
+	}
+	if !s.logAt.IsZero() && now.Sub(s.logAt) < time.Second {
+		return
+	}
+	s.logAt = now
+	if s.logf == nil {
+		s.openLogLocked()
+	}
+	if s.logf == nil {
+		return
+	}
+	screen := time.Duration(0)
+	if !s.frameAt.IsZero() {
+		screen = now.Sub(s.frameAt)
+	}
+	path := "video"
+	if s.tier == "capture" {
+		path = "capture"
+	}
+	fmt.Fprintf(s.logf, "%s path=%s %dx%d fps=%d usb=%d usbMax=%d decode=%d screen=%d clock=%d queue=%d tier=%s shot=%d sent=%d\n",
+		now.Format("15:04:05"),
+		path,
+		s.videoW, s.videoH,
+		s.fps,
+		s.usbWait.Milliseconds(),
+		s.usbMax.Milliseconds(),
+		s.decLast.Milliseconds(),
+		screen.Milliseconds(),
+		s.lag.Milliseconds(),
+		len(s.decQ),
+		s.tier,
+		s.shot.Milliseconds(),
+		s.sentN,
+	)
+	s.usbMax = 0
+	s.sentN = 0
+}
+
+func (s *Session) openLogLocked() {
+	path := latencyLogPath()
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	s.logf = f
+	s.logPath = path
+	fmt.Fprintf(f, "--- %s ---\n", time.Now().Format(time.RFC3339))
+	_, _ = f.WriteString("# usb=PC wait for bytes (ms). usbMax=worst this second. decode=ffmpeg (ms). screen=picture age (ms). clock=PTS drift (ms; a steady 0 can still hide a constant delay inside the phone). queue=frames sitting in ffmpeg. shot=screencap (ms). sent=pictures given to ffmpeg this second.\n")
+}
+
+func latencyLogPath() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return ""
+		}
+		base = filepath.Join(home, "AppData", "Local")
+	}
+	return filepath.Join(base, "Luma", "latency.log")
+}
+
+func (s *Session) TraceLine() (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tier == "capture" {
+		return fmt.Sprintf("slow capture · shot %dms", s.shot.Milliseconds()), s.logPath
+	}
+	screen := time.Duration(0)
+	if !s.frameAt.IsZero() {
+		screen = time.Since(s.frameAt)
+	}
+	fps := s.fps
+	if fps == 0 {
+		fps = s.fpsN
+	}
+	tier := s.tier
+	if tier == "" {
+		tier = "video"
+	}
+	line := fmt.Sprintf("%d fps · usb %dms · decode %dms · screen %dms · clock %dms · %s",
+		fps, s.usbWait.Milliseconds(), s.decLast.Milliseconds(), screen.Milliseconds(), s.lag.Milliseconds(), tier)
+	if len(s.decQ) > 2 {
+		line += fmt.Sprintf(" · queue %d", len(s.decQ))
+	}
+	return line, s.logPath
+}
+
+func pictureCount(show [][]byte, view []viewPkt) int {
+	n := 0
+	for _, p := range view {
+		if p.config || len(p.blob) == 0 {
+			continue
+		}
+		for _, b := range show {
+			if len(b) > 0 && &b[0] == &p.blob[0] {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
 type viewPkt struct {
 	config bool
 	key    bool
@@ -733,8 +937,9 @@ func displayBlobs(batch []viewPkt) [][]byte {
 }
 
 type streamReader struct {
-	c   net.Conn
-	buf []byte
+	c    net.Conn
+	buf  []byte
+	wait time.Duration
 }
 
 func (s *streamReader) takeBlocking(n int) ([]byte, error) {
@@ -784,6 +989,10 @@ func (s *streamReader) moreSoon() bool {
 }
 
 func (s *streamReader) readAtLeast(n int) error {
+	if len(s.buf) >= n {
+		return nil
+	}
+	start := time.Now()
 	for len(s.buf) < n {
 		_ = s.c.SetReadDeadline(time.Time{})
 		tmp := make([]byte, 32*1024)
@@ -795,6 +1004,7 @@ func (s *streamReader) readAtLeast(n int) error {
 			return err
 		}
 	}
+	s.wait = time.Since(start)
 	return nil
 }
 
@@ -915,10 +1125,12 @@ func (s *Session) pumpRaw(r io.Reader, w, h int) {
 			if _, err := io.ReadFull(br, skip); err != nil {
 				return
 			}
+			s.noteDecodeDone(false)
 		}
 		if _, err := io.ReadFull(br, imgs[slot].Pix); err != nil {
 			return
 		}
+		s.noteDecodeDone(true)
 		img := imgs[slot]
 		slot = (slot + 1) % len(imgs)
 		s.mu.Lock()
@@ -981,8 +1193,10 @@ func (s *Session) tearStream() {
 func (s *Session) startCompat() error {
 	go func() {
 		for s.ctx.Err() == nil {
+			t0 := time.Now()
 			cmd := s.adb.ExecOut(s.ctx, s.serial, "screencap", "-p")
 			out, err := cmd.Output()
+			shot := time.Since(t0)
 			if err != nil || s.ctx.Err() != nil {
 				time.Sleep(300 * time.Millisecond)
 				continue
@@ -996,6 +1210,9 @@ func (s *Session) startCompat() error {
 			s.mu.Lock()
 			s.frame = Frame{Image: img, VideoW: b.Dx(), VideoH: b.Dy(), Smooth: false}
 			s.videoW, s.videoH = b.Dx(), b.Dy()
+			s.shot = shot
+			s.frameAt = time.Now()
+			s.maybeLogLocked(s.frameAt)
 			s.mu.Unlock()
 			if s.on != nil {
 				s.on()
