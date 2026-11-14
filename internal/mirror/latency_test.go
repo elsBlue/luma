@@ -1,6 +1,8 @@
 package mirror
 
 import (
+	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -87,6 +89,38 @@ func TestChooseHardwareH264Encoder(t *testing.T) {
 	if shortEncoder("c2.qti.avc.encoder") != "qcom" || shortEncoder("OMX.MTK.VIDEO.ENCODER.AVC") != "mtk" {
 		t.Fatal("short name")
 	}
+}
+
+func TestHandshakeRetriesAfterEOF(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	go func() {
+		var n int
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			n++
+			if n == 1 {
+				_ = c.Close()
+				continue
+			}
+			_, _ = c.Write([]byte{0})
+			time.Sleep(time.Second)
+			_ = c.Close()
+			return
+		}
+	}()
+	c, err := dialHandshake(context.Background(), port, time.Now().Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
 }
 
 func TestPreviewFitsTheWindow(t *testing.T) {

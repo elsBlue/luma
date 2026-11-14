@@ -560,7 +560,6 @@ func (s *Session) tryLink(opts, encoder string) error {
 }
 
 func (s *Session) stream(forward bool, opts, encoder string) error {
-	s.killServer()
 	scid, socket := newSCID()
 	port, err := freePort()
 	if err != nil {
@@ -613,11 +612,20 @@ func (s *Session) stream(forward bool, opts, encoder string) error {
 
 	var video, ctrl net.Conn
 	if forward {
-		video, err = dialRetry(ctx, port, 8*time.Second)
+		// adb accepts the TCP connection before the phone is listening, then
+		// closes it. That is the "no handshake: EOF". Keep dialing until the
+		// phone writes its first byte.
+		deadline := time.Now().Add(8 * time.Second)
+		video, err = dialHandshake(ctx, port, deadline)
 		if err != nil {
-			return fmt.Errorf("phone did not open video: %w", err)
+			select {
+			case <-shellDone:
+				return fmt.Errorf("phone encoder stopped")
+			default:
+				return fmt.Errorf("no handshake: %w", err)
+			}
 		}
-		ctrl, err = dialRetry(ctx, port, 4*time.Second)
+		ctrl, err = dialHandshake(ctx, port, deadline)
 		if err != nil {
 			_ = video.Close()
 			return fmt.Errorf("phone did not open control: %w", err)
@@ -644,11 +652,6 @@ func (s *Session) stream(forward bool, opts, encoder string) error {
 	tune(ctrl)
 
 	_ = video.SetReadDeadline(time.Now().Add(6 * time.Second))
-	if forward {
-		if _, err := io.ReadFull(video, make([]byte, 1)); err != nil {
-			return fmt.Errorf("no handshake: %w", err)
-		}
-	}
 	name := make([]byte, 64)
 	if _, err := io.ReadFull(video, name); err != nil {
 		return fmt.Errorf("no device name: %w", err)
@@ -1514,26 +1517,57 @@ func freePort() (int, error) {
 	return port, nil
 }
 
-func dialRetry(ctx context.Context, port int, d time.Duration) (net.Conn, error) {
-	dead := time.Now().Add(d)
+func dialHandshake(ctx context.Context, port int, deadline time.Time) (net.Conn, error) {
 	var last error
-	for time.Now().Before(dead) {
-		dialer := net.Dialer{Timeout: 400 * time.Millisecond}
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		remain := time.Until(deadline)
+		if remain > 400*time.Millisecond {
+			remain = 400 * time.Millisecond
+		}
+		dialer := net.Dialer{Timeout: remain}
 		c, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			last = err
+			if !sleepCtx(ctx, 80*time.Millisecond) {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		wait := 500 * time.Millisecond
+		if left := time.Until(deadline); left < wait {
+			wait = left
+		}
+		_ = c.SetReadDeadline(time.Now().Add(wait))
+		var b [1]byte
+		_, err = io.ReadFull(c, b[:])
 		if err == nil {
+			_ = c.SetReadDeadline(time.Time{})
 			return c, nil
 		}
 		last = err
-		select {
-		case <-ctx.Done():
+		_ = c.Close()
+		if !sleepCtx(ctx, 60*time.Millisecond) {
 			return nil, ctx.Err()
-		case <-time.After(120 * time.Millisecond):
 		}
 	}
 	if last == nil {
 		last = fmt.Errorf("timeout")
 	}
 	return nil, last
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func cappedSize(n int) int {
