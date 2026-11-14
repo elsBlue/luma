@@ -27,9 +27,10 @@ Click the picture to tap. Drag to swipe. Scroll the wheel to scroll. Type to sen
 ## What you can do
 
 - Back, Home, Recents, volume, power, rotate
-- Quality: Low, Fair, High, Max
+- Picture: Fast, 720p, 1080p, YouTube. Nothing is encoded above 1080p (long side 1920).
+- USB uses a zero-buffer H.264 decode, so taps and the picture stay close to the phone.
 - Screenshot (saved in `Pictures\Luma`)
-- Record (saved in `Videos\Luma`)
+- Record at the stream you picked (saved in `Videos\Luma`, ready to drop into YouTube)
 - Paste your PC clipboard onto the phone
 - Install an APK
 - Send a file into the phone's Download folder

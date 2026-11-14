@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
-	"image/jpeg"
 	"image/png"
 	"io"
 	"net"
@@ -31,10 +30,10 @@ type Quality struct {
 }
 
 var Qualities = []Quality{
-	{Name: "Low", MaxSize: 720, Bitrate: 2_000_000, FPS: 30},
-	{Name: "Fair", MaxSize: 1024, Bitrate: 4_000_000, FPS: 30},
-	{Name: "High", MaxSize: 1600, Bitrate: 8_000_000, FPS: 60},
-	{Name: "Max", MaxSize: 0, Bitrate: 16_000_000, FPS: 60},
+	{Name: "Fast", MaxSize: 960, Bitrate: 4_000_000, FPS: 60},
+	{Name: "720p", MaxSize: 1280, Bitrate: 6_000_000, FPS: 60},
+	{Name: "1080p", MaxSize: 1920, Bitrate: 8_000_000, FPS: 60},
+	{Name: "YouTube", MaxSize: 1920, Bitrate: 12_000_000, FPS: 60},
 }
 
 type Frame struct {
@@ -73,6 +72,10 @@ type Session struct {
 	linkForward bool
 	linkSpec    string
 	stopOnce    sync.Once
+
+	moveMu      sync.Mutex
+	movePending []byte
+	moveTimer   *time.Timer
 
 	jobs    chan func()
 	on      func()
@@ -169,6 +172,11 @@ func (s *Session) Touch(action byte, x, y, w, h int) {
 			actionButton = proto.ButtonPrimary
 		}
 		msg := proto.TouchMessage(action, x, y, w, h, pressure, actionButton, buttons)
+		if action == proto.ActionMove {
+			s.queueMove(msg)
+			return
+		}
+		s.flushMove()
 		s.writeCtrl(msg)
 		return
 	}
@@ -271,6 +279,38 @@ func (s *Session) Paste(text string) {
 	s.Text(text)
 }
 
+func (s *Session) queueMove(msg []byte) {
+	s.moveMu.Lock()
+	s.movePending = msg
+	if s.moveTimer == nil {
+		s.moveTimer = time.AfterFunc(4*time.Millisecond, func() {
+			s.moveMu.Lock()
+			s.moveTimer = nil
+			msg := s.movePending
+			s.movePending = nil
+			s.moveMu.Unlock()
+			if msg != nil {
+				s.writeCtrl(msg)
+			}
+		})
+	}
+	s.moveMu.Unlock()
+}
+
+func (s *Session) flushMove() {
+	s.moveMu.Lock()
+	if s.moveTimer != nil {
+		s.moveTimer.Stop()
+		s.moveTimer = nil
+	}
+	msg := s.movePending
+	s.movePending = nil
+	s.moveMu.Unlock()
+	if msg != nil {
+		s.writeCtrl(msg)
+	}
+}
+
 func (s *Session) writeCtrl(msg []byte) {
 	s.mu.Lock()
 	c := s.ctrl
@@ -296,18 +336,27 @@ func (s *Session) startSmooth() error {
 		return fmt.Errorf("could not copy the phone service: %w", err)
 	}
 	var first error
-	if err := s.stream(false); err != nil {
+	if err := s.tryLink(true); err != nil {
 		first = err
 		s.tearStream()
-		if err2 := s.stream(true); err2 != nil {
+		if err2 := s.tryLink(false); err2 != nil {
 			s.tearStream()
 			return fmt.Errorf("%v", first)
 		}
+		s.Warning = "This phone rejected the low-delay encoder flags. Picture is still capped at 1080p."
 	}
 	return nil
 }
 
-func (s *Session) stream(forward bool) error {
+func (s *Session) tryLink(low bool) error {
+	if err := s.stream(false, low); err != nil {
+		s.tearStream()
+		return s.stream(true, low)
+	}
+	return nil
+}
+
+func (s *Session) stream(forward bool, low bool) error {
 	scid, socket := newSCID()
 	port, err := freePort()
 	if err != nil {
@@ -334,9 +383,13 @@ func (s *Session) stream(forward bool) error {
 		}
 		s.rememberLink(false, spec)
 	}
+	codec := ""
+	if low {
+		codec = " video_codec_options=latency:int=0,priority:int=0,i-frame-interval:int=2"
+	}
 	cmdLine := fmt.Sprintf(
-		"CLASSPATH=/data/local/tmp/luma-server.jar app_process / com.genymobile.scrcpy.Server %s scid=%s log_level=info tunnel_forward=%t audio=false control=true video=true video_codec=h264 max_size=%d max_fps=%d video_bit_rate=%d stay_awake=true power_on=true",
-		proto.ServerVersion, scid, forward, s.q.MaxSize, s.q.FPS, s.q.Bitrate,
+		"CLASSPATH=/data/local/tmp/luma-server.jar app_process / com.genymobile.scrcpy.Server %s scid=%s log_level=info tunnel_forward=%t audio=false control=true video=true video_codec=h264 max_size=%d max_fps=%d video_bit_rate=%d stay_awake=true power_on=true send_frame_meta=true send_codec_meta=true send_device_meta=true%s",
+		proto.ServerVersion, scid, forward, cappedSize(s.q.MaxSize), s.q.FPS, s.q.Bitrate, codec,
 	)
 	shell, stdout, err := s.adb.StartShell(ctx, s.serial, cmdLine)
 	if err != nil {
@@ -378,6 +431,8 @@ func (s *Session) stream(forward bool) error {
 	s.conns = []net.Conn{video, ctrl}
 	s.ctrl = ctrl
 	s.mu.Unlock()
+	tune(video)
+	tune(ctrl)
 
 	_ = video.SetReadDeadline(time.Now().Add(6 * time.Second))
 	if forward {
@@ -428,48 +483,12 @@ func (s *Session) waitFrame(d time.Duration) <-chan struct{} {
 }
 
 func (s *Session) startDecoder(video net.Conn) error {
-	ff := exec.CommandContext(s.ctx, s.ff,
-		"-hide_banner", "-loglevel", "error",
-		"-fflags", "nobuffer",
-		"-flags", "low_delay",
-		"-probesize", "32",
-		"-analyzeduration", "0",
-		"-f", "h264",
-		"-i", "pipe:0",
-		"-an",
-		"-q:v", "4",
-		"-f", "image2pipe",
-		"-vcodec", "mjpeg",
-		"pipe:1",
-	)
-	hide(ff)
-	stdin, err := ff.StdinPipe()
-	if err != nil {
-		return err
-	}
-	stdout, err := ff.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	var ferr bytes.Buffer
-	ff.Stderr = &ferr
-	if err := ff.Start(); err != nil {
-		return fmt.Errorf("decoder: %w", err)
-	}
-	s.mu.Lock()
-	s.ffCmd = ff
-	s.mu.Unlock()
-	go s.pumpVideo(video, stdin)
-	go s.pumpJPEG(stdout)
-	go func() {
-		_ = ff.Wait()
-	}()
+	go s.pumpVideo(video)
 	return nil
 }
 
-func (s *Session) pumpVideo(r net.Conn, w io.WriteCloser) {
-	defer w.Close()
-	br := bufio.NewReaderSize(r, 256*1024)
+func (s *Session) pumpVideo(r net.Conn) {
+	br := bufio.NewReaderSize(r, 1<<20)
 	codec := make([]byte, 4)
 	if _, err := io.ReadFull(br, codec); err != nil {
 		return
@@ -478,6 +497,13 @@ func (s *Session) pumpVideo(r net.Conn, w io.WriteCloser) {
 	if id != proto.CodecH264 && id != proto.CodecH265 {
 		return
 	}
+	var dec io.WriteCloser
+	defer func() {
+		if dec != nil {
+			_ = dec.Close()
+		}
+	}()
+	var pending [][]byte
 	hdr := make([]byte, 12)
 	for s.ctx.Err() == nil {
 		if _, err := io.ReadFull(br, hdr); err != nil {
@@ -492,6 +518,17 @@ func (s *Session) pumpVideo(r net.Conn, w io.WriteCloser) {
 				s.mu.Lock()
 				s.videoW, s.videoH = h.Width, h.Height
 				s.mu.Unlock()
+				if dec == nil {
+					in, err := s.startRawDecoder(h.Width, h.Height)
+					if err != nil {
+						return
+					}
+					dec = in
+					for _, blob := range pending {
+						_, _ = dec.Write(blob)
+					}
+					pending = nil
+				}
 			}
 			continue
 		}
@@ -518,30 +555,80 @@ func (s *Session) pumpVideo(r net.Conn, w io.WriteCloser) {
 		} else {
 			blob = annex
 		}
-		_, _ = w.Write(blob)
+		if dec == nil {
+			pending = append(pending, append([]byte(nil), blob...))
+			if len(pending) > 48 {
+				return
+			}
+			continue
+		}
+		_, _ = dec.Write(blob)
 		if rec != nil && !h.Config {
 			_, _ = rec.Write(blob)
 		}
 	}
 }
 
-func (s *Session) pumpJPEG(r io.Reader) {
-	br := bufio.NewReaderSize(r, 512*1024)
+func (s *Session) startRawDecoder(w, h int) (io.WriteCloser, error) {
+	if w < 2 || h < 2 || w > 1920 || h > 1920 {
+		return nil, fmt.Errorf("frame %dx%d is outside the 1080p cap", w, h)
+	}
+	ff := exec.CommandContext(s.ctx, s.ff,
+		"-hide_banner", "-loglevel", "error",
+		"-fflags", "nobuffer+discardcorrupt",
+		"-flags", "low_delay",
+		"-probesize", "32",
+		"-analyzeduration", "0",
+		"-threads", "1",
+		"-f", "h264",
+		"-i", "pipe:0",
+		"-an",
+		"-threads", "1",
+		"-vsync", "0",
+		"-pix_fmt", "rgba",
+		"-f", "rawvideo",
+		"pipe:1",
+	)
+	hide(ff)
+	stdin, err := ff.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := ff.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	var ferr bytes.Buffer
+	ff.Stderr = &ferr
+	if err := ff.Start(); err != nil {
+		return nil, fmt.Errorf("decoder: %w", err)
+	}
+	s.mu.Lock()
+	s.ffCmd = ff
+	s.mu.Unlock()
+	go s.pumpRaw(stdout, w, h)
+	go func() {
+		_ = ff.Wait()
+	}()
+	return stdin, nil
+}
+
+func (s *Session) pumpRaw(r io.Reader, w, h int) {
+	stride := w * h * 4
+	buf := make([]byte, stride)
+	br := bufio.NewReaderSize(r, stride)
 	for s.ctx.Err() == nil {
-		raw, err := readJPEG(br)
-		if err != nil {
+		if _, err := io.ReadFull(br, buf); err != nil {
 			return
 		}
-		img, err := jpeg.Decode(bytes.NewReader(raw))
-		if err != nil {
-			continue
-		}
+		img := image.NewRGBA(image.Rect(0, 0, w, h))
+		copy(img.Pix, buf)
 		s.mu.Lock()
-		s.frame = Frame{Image: img, VideoW: s.videoW, VideoH: s.videoH, Smooth: true}
-		if s.frame.VideoW == 0 {
-			s.frame.VideoW = img.Bounds().Dx()
-			s.frame.VideoH = img.Bounds().Dy()
+		vw, vh := s.videoW, s.videoH
+		if vw == 0 {
+			vw, vh = w, h
 		}
+		s.frame = Frame{Image: img, VideoW: vw, VideoH: vh, Smooth: true}
 		s.mu.Unlock()
 		if s.on != nil {
 			s.on()
@@ -638,7 +725,7 @@ func (s *Session) Record(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.smooth {
-		return fmt.Errorf("recording needs the smooth stream. Reconnect on High or Max")
+		return fmt.Errorf("recording needs the smooth stream. Reconnect on 1080p or YouTube")
 	}
 	if s.rec != nil {
 		return nil
@@ -647,10 +734,14 @@ func (s *Session) Record(path string) error {
 		return err
 	}
 	cmd := exec.Command(s.ff,
-		"-y", "-fflags", "+genpts",
-		"-f", "h264", "-i", "pipe:0",
+		"-y",
+		"-use_wallclock_as_timestamps", "1",
+		"-fflags", "+genpts",
+		"-f", "h264",
+		"-i", "pipe:0",
 		"-c", "copy",
-		"-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+		"-movflags", "+faststart",
+		"-metadata", "comment=Luma 1080p",
 		path,
 	)
 	hide(cmd)
@@ -742,6 +833,22 @@ func dialRetry(ctx context.Context, port int, d time.Duration) (net.Conn, error)
 		last = fmt.Errorf("timeout")
 	}
 	return nil, last
+}
+
+func cappedSize(n int) int {
+	if n <= 0 || n > 1920 {
+		return 1920
+	}
+	return n
+}
+
+func tune(c net.Conn) {
+	tcp, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetNoDelay(true)
+	_ = tcp.SetKeepAlive(true)
 }
 
 func readJPEG(r *bufio.Reader) ([]byte, error) {

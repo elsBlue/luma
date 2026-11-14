@@ -32,7 +32,7 @@ func main() {
 			}
 		}()
 		w := new(app.Window)
-		w.Option(app.Title("Luma"), app.Size(1180, 760), app.MinSize(980, 640))
+		w.Option(app.Title("Luma"), app.Size(1180, 760), app.MinSize(1020, 640))
 		if err := run(w); err != nil {
 			alert("Luma", err.Error())
 			os.Exit(1)
@@ -84,10 +84,10 @@ func run(w *app.Window) error {
 	th := material.NewTheme()
 	th.Shaper = text.NewShaper(text.WithCollection(gofont.Collection()))
 	th.Palette = material.Palette{
-		Fg:         color.NRGBA{R: 243, G: 234, B: 223, A: 255},
-		Bg:         color.NRGBA{R: 34, G: 30, B: 24, A: 255},
-		ContrastBg: color.NRGBA{R: 232, G: 165, B: 75, A: 255},
-		ContrastFg: color.NRGBA{R: 28, G: 20, B: 10, A: 255},
+		Fg:         color.NRGBA{R: 238, G: 242, B: 246, A: 255},
+		Bg:         color.NRGBA{R: 18, G: 21, B: 27, A: 255},
+		ContrastBg: color.NRGBA{R: 76, G: 141, B: 255, A: 255},
+		ContrastFg: color.NRGBA{R: 6, G: 16, B: 28, A: 255},
 	}
 	u := &ui{
 		win:     w,
@@ -200,6 +200,23 @@ func (u *ui) stopSession() {
 	}
 }
 
+func (u *ui) restartMirror() {
+	u.mu.Lock()
+	s := u.session
+	u.session = nil
+	u.busy = true
+	u.status = "Switching picture…"
+	u.mu.Unlock()
+	u.win.Invalidate()
+	if s != nil {
+		s.Stop()
+	}
+	u.mu.Lock()
+	u.busy = false
+	u.mu.Unlock()
+	u.beginMirror()
+}
+
 func (u *ui) beginMirror() {
 	u.mu.Lock()
 	if u.busy || u.client == nil {
@@ -247,7 +264,7 @@ func (u *ui) beginMirror() {
 		if sess.Warning != "" {
 			u.status = sess.Warning
 		} else if sess.Smooth() {
-			u.status = "Live. Click the screen and type. Right-click goes back."
+			u.status = "Live · 1080p cap · low delay. Click the screen and type."
 		} else {
 			u.status = "Connected."
 		}

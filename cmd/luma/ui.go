@@ -27,15 +27,15 @@ import (
 )
 
 var (
-	colBg    = color.NRGBA{R: 18, G: 16, B: 13, A: 255}
-	colPanel = color.NRGBA{R: 32, G: 28, B: 22, A: 255}
-	colRaise = color.NRGBA{R: 48, G: 42, B: 33, A: 255}
-	colLine  = color.NRGBA{R: 78, G: 66, B: 50, A: 255}
-	colText  = color.NRGBA{R: 243, G: 234, B: 223, A: 255}
-	colMute  = color.NRGBA{R: 164, G: 152, B: 136, A: 255}
-	colAmber = color.NRGBA{R: 232, G: 165, B: 75, A: 255}
-	colInk   = color.NRGBA{R: 28, G: 20, B: 10, A: 255}
-	colRec   = color.NRGBA{R: 214, G: 92, B: 74, A: 255}
+	colBg    = color.NRGBA{R: 11, G: 13, B: 17, A: 255}
+	colPanel = color.NRGBA{R: 18, G: 21, B: 27, A: 255}
+	colRaise = color.NRGBA{R: 27, G: 33, B: 42, A: 255}
+	colLine  = color.NRGBA{R: 44, G: 52, B: 64, A: 255}
+	colText  = color.NRGBA{R: 238, G: 242, B: 246, A: 255}
+	colMute  = color.NRGBA{R: 147, G: 160, B: 176, A: 255}
+	colAmber = color.NRGBA{R: 76, G: 141, B: 255, A: 255}
+	colInk   = color.NRGBA{R: 6, G: 16, B: 28, A: 255}
+	colRec   = color.NRGBA{R: 255, G: 77, B: 77, A: 255}
 )
 
 type stage struct {
@@ -57,7 +57,7 @@ func (u *ui) layout(gtx layout.Context) layout.Dimensions {
 	paint.Fill(gtx.Ops, colBg)
 	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints.Min.X = gtx.Dp(unit.Dp(292))
+			gtx.Constraints.Min.X = gtx.Dp(unit.Dp(320))
 			gtx.Constraints.Max.X = gtx.Constraints.Min.X
 			gtx.Constraints.Min.Y = gtx.Constraints.Max.Y
 			return u.sidebar(gtx)
@@ -94,8 +94,13 @@ func (u *ui) act(gtx layout.Context) {
 	for i := range u.quals {
 		if u.quals[i].Clicked(gtx) {
 			u.mu.Lock()
+			changed := u.quality != i
 			u.quality = i
+			live := u.session != nil && changed
 			u.mu.Unlock()
+			if live {
+				go u.restartMirror()
+			}
 		}
 	}
 	u.mu.Lock()
@@ -192,7 +197,7 @@ func (u *ui) sideBody(gtx layout.Context) layout.Dimensions {
 		}),
 		rigid(4),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			l := material.Label(u.th, unit.Sp(13), "Mirror and control your Android phone. No account. No paid tier.")
+			l := material.Label(u.th, unit.Sp(13), "Mirror a phone. USB stays low-delay. Picture never goes past 1080p.")
 			l.Color = colMute
 			return l.Layout(gtx)
 		}),
@@ -226,7 +231,7 @@ func (u *ui) sideBody(gtx layout.Context) layout.Dimensions {
 		}),
 		rigid(10),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			l := material.Label(u.th, unit.Sp(12), "Picture quality")
+			l := material.Label(u.th, unit.Sp(12), "Picture · 1080p cap")
 			l.Color = colMute
 			return l.Layout(gtx)
 		}),
@@ -235,6 +240,12 @@ func (u *ui) sideBody(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 				u.qbtn(0, q), u.qbtn(1, q), u.qbtn(2, q), u.qbtn(3, q),
 			)
+		}),
+		rigid(4),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			l := material.Label(u.th, unit.Sp(12), "Fast is the quickest. YouTube is 1080p60 for a clean recording.")
+			l.Color = colMute
+			return l.Layout(gtx)
 		}),
 		rigid(12),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
